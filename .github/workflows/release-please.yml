@@ -55,7 +55,9 @@ jobs:
             echo "No release-please branch, nothing to sync."
             exit 0
           fi
-          git fetch --depth 1 origin "$BRANCH"
+          # Explicit refspec: a shallow clone has no remote-tracking ref for
+          # this branch, and a plain `fetch <branch>` only writes FETCH_HEAD.
+          git fetch --depth 1 origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
           git switch --track "origin/$BRANCH"
           node src/tools/sync-addon-changelog.ts
           if git diff --quiet -- ble-scale-sync-addon/CHANGELOG.md; then
