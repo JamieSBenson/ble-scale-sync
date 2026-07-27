@@ -42,11 +42,20 @@ export function esphomeUuidToString(uuidList?: Array<string | number | bigint>):
  * with a pre-decoded `uuid` string. We prefer `uuid` and keep `uuidList` as a
  * fallback in case a different library version delivers the raw shape.
  */
+export interface EsphomeGattDescriptor {
+  uuid?: string;
+  uuidList?: Array<string | number | bigint>;
+  shortUuid?: number;
+  handle: number;
+}
+
 export interface EsphomeGattCharacteristic {
   uuid?: string;
   uuidList?: Array<string | number | bigint>;
   handle: number;
-  properties: number;
+  /** Optional so an unexpected library shape cannot break the whole session. */
+  properties?: number;
+  descriptorsList?: EsphomeGattDescriptor[];
 }
 
 export interface EsphomeGattService {
@@ -76,14 +85,61 @@ export interface EsphomeNotifyData {
  *
  * @2colors/esphome-native-api emits `message.toObject()` for GATT responses
  * unmapped, and protobuf-JS renders a `bytes` field as a base64 string named
- * `data` — never `dataList` (#291). Accept every shape the library could
+ * `data`, and never as `dataList` (#291). Accept every shape the library could
  * produce: base64 string, Uint8Array/Buffer, or a legacy `dataList` array.
+ *
+ * The empty-string guard matters: `data: ''` is a "field not used" sentinel in
+ * this library, not an empty payload. mapRawAdvertisement builds entries as
+ * `{ uuid, legacyDataList: [...], data: '' }`, so a `dataList` shape must still
+ * win over an empty `data` (the same precedence advert.ts already applies).
  */
 export function esphomeGattPayload(m: { data?: string | Uint8Array; dataList?: number[] }): Buffer {
-  if (typeof m.data === 'string') return Buffer.from(m.data, 'base64');
+  if (typeof m.data === 'string' && m.data.length > 0) return Buffer.from(m.data, 'base64');
   if (m.data instanceof Uint8Array) return Buffer.from(m.data);
   if (Array.isArray(m.dataList)) return Buffer.from(m.dataList);
   return Buffer.alloc(0);
+}
+
+/** Client Characteristic Configuration descriptor (CCCD). */
+export const CCCD_UUID = normalizeUuid('2902');
+/** CCCD value that enables notifications. */
+export const CCCD_NOTIFY = Uint8Array.from([0x01, 0x00]);
+/** CCCD value that enables indications. */
+export const CCCD_INDICATE = Uint8Array.from([0x02, 0x00]);
+
+const CHAR_PROP_NOTIFY = 0x10;
+const CHAR_PROP_INDICATE = 0x20;
+
+/**
+ * Find the handle of a characteristic's 0x2902 descriptor.
+ *
+ * ESPHome's bluetooth_proxy implements `bluetooth_gatt_notify` as
+ * `esp_ble_gattc_register_for_notify()`, which only tells the ESP32 to route
+ * notifications it receives. ESP-IDF leaves writing the CCC descriptor to the
+ * client, so without this handle the peripheral is never actually told to send
+ * anything (#252).
+ */
+export function findCccdHandle(ch: EsphomeGattCharacteristic): number | undefined {
+  for (const d of ch.descriptorsList ?? []) {
+    let uuid = d.uuid ? normalizeUuid(d.uuid) : esphomeUuidToString(d.uuidList);
+    if (!uuid && typeof d.shortUuid === 'number') uuid = esphomeUuidToString([d.shortUuid]);
+    if (uuid === CCCD_UUID) return d.handle;
+  }
+  return undefined;
+}
+
+/**
+ * CCCD payload for a characteristic's property bits, or undefined when it
+ * supports neither notify nor indicate. Notify wins when both bits are set,
+ * matching Home Assistant's own ESPHome BLE client.
+ */
+export function cccdValueFor(properties?: number): Uint8Array | undefined {
+  // Unknown library shape: notify is the safe default, it is what every
+  // notify-capable scale in the registry expects.
+  if (typeof properties !== 'number') return CCCD_NOTIFY;
+  if (properties & CHAR_PROP_NOTIFY) return CCCD_NOTIFY;
+  if (properties & CHAR_PROP_INDICATE) return CCCD_INDICATE;
+  return undefined;
 }
 
 export interface EsphomeDeviceConnection {

@@ -3,8 +3,10 @@ import { bleLog, errMsg, normalizeUuid } from '../types.js';
 import type { EsphomeClient, EsphomeConnection } from './client.js';
 import { macToInt } from './advert.js';
 import {
+  cccdValueFor,
   esphomeGattPayload,
   esphomeUuidToString,
+  findCccdHandle,
   type EsphomeGattServicesResponse,
   type EsphomeNotifyData,
   type EsphomeDeviceConnection,
@@ -12,6 +14,7 @@ import {
 
 const NOTIFY_EVENT = 'message.BluetoothGATTNotifyDataResponse';
 const CONNECTION_EVENT = 'message.BluetoothDeviceConnectionResponse';
+const GATT_ERROR_EVENT = 'message.BluetoothGATTErrorResponse';
 
 export interface GattSession {
   /** Normalized-UUID -> BleChar, the shape waitForRawReading() consumes. */
@@ -67,7 +70,26 @@ export async function openGattSession(
     addr,
   )) as EsphomeGattServicesResponse;
 
+  bleLog.debug(`ESPHome connected to ${mac} (mtu=${connResp.mtu ?? 'unknown'})`);
+
   let closed = false;
+
+  // The library's sendMessageAwaitResponse() resolves on the FIRST matching
+  // response event and does not correlate by address or handle, so two GATT
+  // requests in flight at once can swap replies (a descriptor write and a
+  // characteristic write both await BluetoothGATTWriteResponse). Adapters do run
+  // concurrently with subscribe during startInit, so every request for this
+  // session goes through one queue (#252).
+  let queue: Promise<unknown> = Promise.resolve();
+  const serial = <T>(fn: () => Promise<T>): Promise<T> => {
+    const next = queue.then(fn, fn);
+    queue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  };
+
   const registered: Array<{ event: string; fn: (m: unknown) => void }> = [];
   const track = (event: string, fn: (m: unknown) => void): (() => void) => {
     conn.on(event, fn);
@@ -79,6 +101,17 @@ export async function openGattSession(
     };
   };
 
+  track(GATT_ERROR_EVENT, (raw: unknown) => {
+    const m = raw as { address: number; handle: number; error: number };
+    if (m.address !== addr) return;
+    bleLog.debug(`ESPHome GATT error: handle 0x${m.handle.toString(16)} status=${m.error}`);
+  });
+
+  // One log line per unexpected peer address for the whole session: every
+  // listener sees every notify event, so a per-listener guard would multiply it
+  // by the number of subscribed characteristics.
+  const loggedForeignAddresses = new Set<number>();
+
   const charMap = new Map<string, BleChar>();
   for (const svc of services.servicesList ?? []) {
     for (const ch of svc.characteristicsList ?? []) {
@@ -88,10 +121,19 @@ export async function openGattSession(
       const uuid = ch.uuid ? normalizeUuid(ch.uuid) : esphomeUuidToString(ch.uuidList);
       if (!uuid) continue;
       const handle = ch.handle;
+      const props = ch.properties;
+      const cccdHandle = findCccdHandle(ch);
+      bleLog.debug(
+        `ESPHome GATT char ${uuid} handle=0x${handle.toString(16)} props=0x${(props ?? 0).toString(16)} cccd=${
+          cccdHandle === undefined ? 'none' : `0x${cccdHandle.toString(16)}`
+        }`,
+      );
 
       const char: BleChar = {
         async read(): Promise<Buffer> {
-          const r = (await conn.readBluetoothGATTCharacteristicService(addr, handle)) as {
+          const r = (await serial(() =>
+            conn.readBluetoothGATTCharacteristicService(addr, handle),
+          )) as {
             data?: string | Uint8Array;
             dataList?: number[];
           };
@@ -102,19 +144,55 @@ export async function openGattSession(
           // One atomic characteristic write, matching the native node-ble
           // handler. ESPHome's bluetooth_proxy handles ATT-level fragmentation;
           // splitting here would send N distinct values, not a long write.
-          await conn.writeBluetoothGATTCharacteristicService(
-            addr,
-            handle,
-            Uint8Array.from(data),
-            withResponse,
+          await serial(() =>
+            conn.writeBluetoothGATTCharacteristicService(
+              addr,
+              handle,
+              Uint8Array.from(data),
+              withResponse,
+            ),
           );
         },
         async subscribe(onData: (data: Buffer) => void): Promise<() => void> {
-          await conn.notifyBluetoothGATTCharacteristicService(addr, handle);
+          await serial(() => conn.notifyBluetoothGATTCharacteristicService(addr, handle));
+          // Registering with the proxy only routes notifications the ESP32
+          // receives; ESP-IDF requires the client to write the CCC descriptor
+          // before the peripheral sends any (#252). Register first so a
+          // notification fired the instant the CCCD lands is already routed.
+          const cccdValue = cccdValueFor(props);
+          if (cccdHandle !== undefined && cccdValue !== undefined) {
+            try {
+              await serial(() =>
+                conn.writeBluetoothGATTDescriptorService(addr, cccdHandle, cccdValue),
+              );
+              bleLog.debug(
+                `ESPHome CCCD write handle 0x${cccdHandle.toString(16)} = ${Buffer.from(
+                  cccdValue,
+                ).toString('hex')} for char 0x${handle.toString(16)}`,
+              );
+            } catch (e) {
+              // A scale that ignores the CCCD still gets the old behaviour.
+              bleLog.debug(
+                `ESPHome CCCD write failed for char 0x${handle.toString(16)}: ${errMsg(e)}`,
+              );
+            }
+          } else if (cccdHandle === undefined) {
+            bleLog.debug(
+              `ESPHome: no CCCD descriptor reported for char 0x${handle.toString(16)}; relying on the proxy registration alone`,
+            );
+          }
           const listener = (raw: unknown): void => {
             if (closed) return;
             const m = raw as EsphomeNotifyData;
-            if (m.address !== addr) return;
+            if (m.address !== addr) {
+              if (!loggedForeignAddresses.has(m.address)) {
+                loggedForeignAddresses.add(m.address);
+                bleLog.debug(
+                  `ESPHome notify for another device (address ${m.address}), ignored for ${mac}`,
+                );
+              }
+              return;
+            }
             if (m.handle === handle) {
               const buf = esphomeGattPayload(m);
               bleLog.debug(
