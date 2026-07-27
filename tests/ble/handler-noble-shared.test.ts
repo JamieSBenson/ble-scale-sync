@@ -50,6 +50,48 @@ describe('createNobleHandler getState injection (#181)', () => {
     expect(fake.stopScanningAsync).toHaveBeenCalledTimes(1);
   });
 
+  it('bounds a notify-enable that never settles and cleans up its listener (#283)', async () => {
+    // @abandonware/noble resolves subscribeAsync only from a single
+    // once('notify') and its WinRT binding emits nothing on several failure
+    // branches, including a CCCD write that returns AsyncStatus::Error. The
+    // reporter's log shows exactly that as "BLEManager::OnNotify: status: 3",
+    // after which the whole reading used to hang until the scale gave up.
+    vi.useFakeTimers();
+    try {
+      const fake = new FakeNoble();
+      const handler = createNobleHandler({
+        noble: fake as unknown as NobleApi,
+        getState: () => fake._state,
+      });
+
+      const listeners = new Map<string, Array<(d: Buffer) => void>>();
+      const char = {
+        uuid: 'fff1',
+        on: (ev: string, fn: (d: Buffer) => void) => {
+          (listeners.get(ev) ?? listeners.set(ev, []).get(ev)!).push(fn);
+        },
+        removeListener: (ev: string, fn: (d: Buffer) => void) => {
+          const arr = listeners.get(ev) ?? [];
+          const i = arr.indexOf(fn);
+          if (i >= 0) arr.splice(i, 1);
+        },
+        // Never settles, exactly like the WinRT silent branch.
+        subscribeAsync: () => new Promise<void>(() => {}),
+      };
+
+      const wrapped = handler._internals.wrapChar(char as never);
+      const promise = wrapped.subscribe(() => {});
+      const assertion = expect(promise).rejects.toThrow(/did not complete within/);
+      await vi.advanceTimersByTimeAsync(11_000);
+      await assertion;
+
+      // The data listener must not be left behind, or every failed cycle leaks one.
+      expect(listeners.get('data') ?? []).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('exposes the broadcastScan internal for both driver entrypoints', () => {
     const fake = new FakeNoble();
     const handler = createNobleHandler({

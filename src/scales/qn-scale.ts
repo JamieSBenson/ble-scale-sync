@@ -11,7 +11,7 @@ import type {
   AdapterRuntimeConfig,
 } from '../interfaces/scale-adapter.js';
 import { uuid16 } from './body-comp-helpers.js';
-import { bleLog } from '../ble/types.js';
+import { bleLog, errMsg } from '../ble/types.js';
 import type { MatchDescriptor } from './match-descriptor.js';
 import type { WeightUnit } from '../config/schema.js';
 
@@ -215,10 +215,16 @@ export class QnScaleAdapter implements ScaleAdapterCore, GattWiring, BroadcastSo
     if (!this.ctx) return;
     try {
       await this.ctx.write(CHR_WRITE, data, false);
-    } catch {
+    } catch (primaryErr: unknown) {
       try {
         await this.ctx.write(CHR_WRITE_T1, data, false);
-      } catch {
+      } catch (altErr: unknown) {
+        // Both write characteristics rejected. Logging this matters: a silent
+        // return here is why a failed handshake looks identical to a scale
+        // that simply never answers (#283).
+        bleLog.debug(
+          `QN write failed on both ${CHR_WRITE} (${errMsg(primaryErr)}) and ${CHR_WRITE_T1} (${errMsg(altErr)}): [${hex(data)}]`,
+        );
         return;
       }
     }
