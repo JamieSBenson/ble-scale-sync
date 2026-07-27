@@ -13,6 +13,8 @@
     "scan": "tsx src/scan.ts",
     "diagnose": "tsx src/diagnose.ts",
     "validate": "tsx src/config/validate-cli.ts",
+    "sync:addon-changelog": "tsx src/tools/sync-addon-changelog.ts",
+    "sync:addon-changelog:check": "tsx src/tools/sync-addon-changelog.ts check",
     "test": "vitest run",
     "lint": "eslint src tests",
     "lint:fix": "eslint src tests --fix",

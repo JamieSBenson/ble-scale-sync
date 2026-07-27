@@ -21,6 +21,19 @@ const CHR_BODY_COMPOSITION = uuid16(0x2a9c); // Body Composition Service 0x181B
 const CHR_USER_CONTROL_POINT = uuid16(0x2a9f); // User Data Service 0x181C
 const CHR_DB_CHANGE_INCREMENT = uuid16(0x2a99); // User Data Service 0x181C
 const CHR_CURRENT_TIME = uuid16(0x2a2b); // Current Time Service 0x1805
+const CHR_DATE_OF_BIRTH = uuid16(0x2a85); // User Data Service 0x181C
+const CHR_GENDER = uuid16(0x2a8c); // User Data Service 0x181C
+const CHR_HEIGHT = uuid16(0x2a8e); // User Data Service 0x181C
+
+// Beurer vendor characteristics on service 0xFFF0, proven from the #229 capture.
+const CHR_VENDOR_USER_LIST = uuid16(0xfff2); // notify: one frame per user slot
+const CHR_VENDOR_ACTIVITY = uuid16(0xfff3); // read/write: activity level
+
+/**
+ * User Data characteristics the scale expects to be committed after consent,
+ * in the order the Beurer app writes them (#229 capture, att.txt 1571-1579).
+ */
+const PROFILE_CHARS = [CHR_DATE_OF_BIRTH, CHR_GENDER, CHR_HEIGHT, CHR_VENDOR_ACTIVITY];
 
 // SIG service UUIDs (normalized 128-bit lowercase form, same as the BLE layer
 // produces via normalizeUuid). Used to corroborate a bare Beurer company id so
@@ -94,12 +107,23 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     { uuid: CHR_BODY_COMPOSITION, type: 'notify' },
     { uuid: CHR_USER_CONTROL_POINT, type: 'notify' },
     { uuid: CHR_DB_CHANGE_INCREMENT, type: 'notify', optional: true },
+    // Vendor user-slot list. The scale answers the FFF2=00 command with one
+    // frame per stored user, which the app requests on every connection (#229).
+    { uuid: CHR_VENDOR_USER_LIST, type: 'notify', optional: true },
     { uuid: CHR_CURRENT_TIME, type: 'write' },
   ];
 
   private cachedWeight = 0;
   private cachedTimestamp: Date | undefined;
   private cachedComp: CachedComp = {};
+  /**
+   * The adapter instance is shared across GATT sessions, so the post-consent
+   * profile sync is keyed on a session counter: a late consent response must
+   * never write into a ConnectionContext that has already been torn down.
+   */
+  private ctx: ConnectionContext | undefined;
+  private session = 0;
+  private profileSyncDone = false;
   /**
    * Composition as it stood when each reading was emitted. Weak so buffered
    * history readings do not pin memory once the processor drops them.
@@ -194,14 +218,100 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     this.cachedWeight = 0;
     this.cachedTimestamp = undefined;
     this.cachedComp = {};
+    this.session += 1;
+    this.ctx = ctx;
+    this.profileSyncDone = false;
 
     await ctx.write(CHR_CURRENT_TIME, this.buildCurrentTime(), true);
+
+    // Vendor user-slot query. The app sends this on every connection, between
+    // the time write and the consent write, and the scale answers with one
+    // frame per stored user (#229 capture). Purely informational for us, but it
+    // keeps our sequence identical to the app's and names the slots in the log.
+    if (ctx.availableChars.has(CHR_VENDOR_USER_LIST)) {
+      try {
+        await ctx.write(CHR_VENDOR_USER_LIST, [0x00], true);
+      } catch (err) {
+        bleLog.debug(`Beurer BF720: vendor user-list query failed: ${String(err)}`);
+      }
+    }
+
     await ctx.write(
       CHR_USER_CONTROL_POINT,
       [UCP_CONSENT, userIndex & 0xff, pin & 0xff, (pin >> 8) & 0xff],
       true,
     );
     bleLog.debug(`Beurer BF720: consent sent for user index ${userIndex}`);
+  }
+
+  /**
+   * Read the scale's stored user data back and commit it unchanged, then bump
+   * the Database Change Increment.
+   *
+   * The #229 capture shows the Beurer app doing exactly this immediately after
+   * the consent is accepted, and only afterwards does the scale send a real
+   * body-composition frame: every frame before the commit carries zeroed
+   * composition fields. Writing back the bytes we just read keeps the user's
+   * on-scale profile intact; we are signalling "profile confirmed", not
+   * changing it.
+   */
+  private async syncUserProfile(session: number): Promise<void> {
+    const ctx = this.ctx;
+    if (!ctx || session !== this.session || this.profileSyncDone) return;
+    this.profileSyncDone = true;
+    try {
+      // Every read and write is isolated: only the BF788 is proven from a
+      // capture, and on a sibling model one locked-down or read-only
+      // characteristic must not cost us the increment below, which is the step
+      // the scale actually waits for.
+      const values = new Map<string, Buffer>();
+      for (const uuid of PROFILE_CHARS) {
+        if (!ctx.availableChars.has(uuid)) continue;
+        if (session !== this.session) return;
+        try {
+          const value = await ctx.read(uuid);
+          if (value.length > 0) values.set(uuid, value);
+        } catch (err) {
+          bleLog.debug(`Beurer BF720: profile read ${uuid} rejected: ${String(err)}`);
+        }
+      }
+      for (const [uuid, value] of values) {
+        if (session !== this.session) return;
+        try {
+          await ctx.write(uuid, value, true);
+        } catch (err) {
+          bleLog.debug(`Beurer BF720: profile write ${uuid} rejected: ${String(err)}`);
+        }
+      }
+      if (ctx.availableChars.has(CHR_DB_CHANGE_INCREMENT)) {
+        if (session !== this.session) return;
+        await ctx.write(CHR_DB_CHANGE_INCREMENT, [0x01, 0x00, 0x00, 0x00], true);
+      }
+      bleLog.debug(
+        `Beurer BF720: user profile committed (${values.size} characteristics); scale can complete the measurement`,
+      );
+    } catch (err) {
+      // Never fail the reading over this: on firmware that does not need the
+      // commit, the measurement arrives regardless.
+      bleLog.debug(`Beurer BF720: user profile sync failed: ${String(err)}`);
+    }
+  }
+
+  /** Decode one vendor user-slot frame (diagnostics only, never a reading). */
+  private handleUserListFrame(data: Buffer): void {
+    if (data.length === 0) return;
+    if (data[0] === 0x01) {
+      bleLog.debug('Beurer BF720: end of user-slot list');
+      return;
+    }
+    if (data[0] !== 0x00 || data.length < 12) return;
+    const slot = data[1];
+    const year = data.readUInt16LE(5);
+    const height = data[9];
+    const gender = data[10] === 0 ? 'male' : 'female';
+    bleLog.debug(
+      `Beurer BF720: user slot ${slot} (born ${year}-${data[7]}-${data[8]}, ${height} cm, ${gender}, activity ${data[11]})`,
+    );
   }
 
   /** Current Time Service 0x2A2B payload (10 bytes). */
@@ -227,6 +337,10 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
       this.handleUcpResponse(data);
       return null;
     }
+    if (charUuid === CHR_VENDOR_USER_LIST) {
+      this.handleUserListFrame(data);
+      return null;
+    }
     if (charUuid === CHR_WEIGHT_MEASUREMENT) {
       this.parseWeightMeasurement(data);
       return this.buildReading();
@@ -249,6 +363,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     const result = data[2];
     if (result === UCP_RESULT_SUCCESS) {
       bleLog.debug('Beurer BF720: consent accepted, awaiting measurement');
+      void this.syncUserProfile(this.session);
     } else if (result === UCP_RESULT_NOT_AUTHORIZED) {
       bleLog.warn(
         'Beurer BF720: consent rejected (USER_NOT_AUTHORIZED). Check `users[].beurer_pin` ' +

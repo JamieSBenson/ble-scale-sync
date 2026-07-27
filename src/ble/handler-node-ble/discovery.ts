@@ -161,6 +161,9 @@ export async function removeDevice(btAdapter: Adapter, mac: string): Promise<voi
       bleLog.debug(`Skipping RemoveDevice: bond state unknown (${errMsg(err)})`);
       return;
     }
+    // Worth a line: an absent node here means BlueZ already dropped the peer's
+    // object, which is the signature of #297.
+    bleLog.debug('Device not in BlueZ cache; RemoveDevice is a no-op');
     paired = false;
   }
   if (paired) {

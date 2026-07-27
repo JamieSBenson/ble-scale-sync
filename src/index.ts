@@ -169,6 +169,17 @@ async function main(): Promise<void> {
     // Attach the display capability; the getter reads the hot-swappable
     // ctx.mqttProxy live so config reloads take effect (#183).
     ctx.display = createMqttProxyDisplayNotifier(() => ctx.mqttProxy);
+    if (!initialResolved.continuousMode) {
+      // The ESP32 connects to a known scale on its own and publishes the
+      // session once. Only the continuous-mode watcher subscribes to that
+      // topic, so in a single run the event lands while nothing is listening
+      // and the weigh-in is silently lost (#296).
+      log.warn(
+        'mqtt-proxy without continuous mode: the ESP32 connects to known scales on its own, ' +
+          'and a single run only listens during its own scan window. ' +
+          'Set runtime.continuous_mode: true (or CONTINUOUS_MODE=true) so autonomous connects are never missed.',
+      );
+    }
   }
   if (ctx.scaleMac) {
     log.info(`Scanning for scale ${ctx.scaleMac}...`);

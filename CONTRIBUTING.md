@@ -305,6 +305,13 @@ Releases are fully automated via [release-please](https://github.com/googleapis/
 2. When `dev` is ready to ship, open a PR `dev` → `main` and merge it.
 3. The `release-please` workflow (`.github/workflows/release-please.yml`) runs on every push to `main` and opens (or updates) a release PR titled `chore(main): release vX.Y.Z`.
 4. That PR shows the proposed version bump plus the generated `CHANGELOG.md` diff. Review, optionally edit the PR body or the CHANGELOG entry in the PR to add prose (for example a `### Thanks` section, the one thing release-please does not generate by itself), then merge it with `--admin` like any other release PR.
+   - The same workflow run also pushes a `chore(addon): sync the add-on changelog` commit to the release branch, because release-please cannot generate a second changelog. If you edit the CHANGELOG entry in the PR afterwards, or the sync step was skipped, regenerate it yourself before merging, otherwise `tests/addon-changelog-sync.test.ts` fails the release PR:
+     ```bash
+     git switch release-please--branches--main--components--ble-scale-sync
+     npm run sync:addon-changelog
+     git commit -am "chore(addon): sync the add-on changelog from the project changelog"
+     git push
+     ```
 5. On merge, release-please tags the release (`vX.Y.Z`), creates a GitHub Release, and emits the `release: published` event that `docker.yml` listens for. The multi-arch image is published to GHCR automatically. VitePress rebuilds `docs/changelog.md` from `CHANGELOG.md` via an `@include` directive, so the public changelog updates too.
 
 ### Files managed by release-please
@@ -317,9 +324,9 @@ Releases are fully automated via [release-please](https://github.com/googleapis/
 
 Do not edit these files in a feature PR. If you need to correct the version or changelog, do it in the release PR before merging.
 
-### Files still maintained by hand
+### Generated companion files
 
-- `ble-scale-sync-addon/CHANGELOG.md` is the user-facing changelog shown inside the Home Assistant add-on UI. It benefits from a shorter, curated log, so release-please does not touch it. Update it in the release PR when user-facing add-on changes ship.
+- `ble-scale-sync-addon/CHANGELOG.md` is the changelog Home Assistant renders on the add-on page. It is generated from the root `CHANGELOG.md` by `src/tools/sync-addon-changelog.ts`; never edit it directly. After the root changelog changes (that is, in the release PR), run `npm run sync:addon-changelog` and commit the result. `tests/addon-changelog-sync.test.ts` fails the build while the copy is stale, which is how it fell 16 releases behind while it was maintained by hand (#294).
 - `docs/changelog.md` is a one-line VitePress include (`<!--@include: ../CHANGELOG.md-->`), so it updates automatically as soon as `CHANGELOG.md` does. Do not replace that include with hand-written content.
 
 ### Optional: `RELEASE_PLEASE_TOKEN` secret

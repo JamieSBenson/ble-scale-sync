@@ -29,3 +29,41 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: .release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # release-please owns CHANGELOG.md but cannot write a second changelog, so
+      # the Home Assistant add-on copy is regenerated on the release PR branch
+      # here. Without this the maintainer has to remember a manual step, which
+      # is exactly how the add-on changelog fell 16 releases behind (#294), and
+      # the guard in tests/addon-changelog-sync.test.ts would fail the release PR.
+      # The generator imports only node: builtins, so it runs straight off
+      # source with no install step.
+      # Node 24: the generator is TypeScript run directly, which needs the
+      # native type stripping that only recent Node has enabled by default.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Sync the add-on changelog on the release PR
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo-sync
+          cd repo-sync
+          BRANCH=$(git ls-remote --heads origin 'release-please--*' | awk '{print $2}' | sed 's#refs/heads/##' | head -1)
+          if [ -z "$BRANCH" ]; then
+            echo "No release-please branch, nothing to sync."
+            exit 0
+          fi
+          git fetch --depth 1 origin "$BRANCH"
+          git switch --track "origin/$BRANCH"
+          node src/tools/sync-addon-changelog.ts
+          if git diff --quiet -- ble-scale-sync-addon/CHANGELOG.md; then
+            echo "Add-on changelog already in sync."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add ble-scale-sync-addon/CHANGELOG.md
+          git commit -m 'chore(addon): sync the add-on changelog from the project changelog'
+          git push origin "HEAD:$BRANCH"

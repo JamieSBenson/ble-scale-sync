@@ -70,6 +70,9 @@ export class ReadingWatcher implements Watcher {
   private config: MqttProxyConfig;
   private profile?: UserProfile;
   private gattInProgress = false;
+  /** Monotonic id of the newest GATT session, so a superseded one cannot tear down its successor (#296). */
+  private gattSessionSeq = 0;
+  private currentDevice: MqttBleDevice | null = null;
   private gattStartedAt = 0;
   private readonly dedup = new DedupWindow(DEDUP_WINDOW_MS);
   /** Weight-only fallback timer per address; on elapse the held reading is queued. */
@@ -168,8 +171,14 @@ export class ReadingWatcher implements Watcher {
       // The ESP32 publishes the same `connected` payload with an extra
       // `autonomous: true` flag when it auto-connects to a known scale MAC.
       if (topic === t.connected) {
+        bleLog.debug(`Connected payload received (${payload.length} bytes)`);
         try {
           const data = JSON.parse(payload.toString());
+          if (!data.autonomous || !data.address) {
+            bleLog.debug(
+              'Connected payload is not an autonomous connect, ignoring (host-initiated response)',
+            );
+          }
           if (data.autonomous && data.address) {
             // The ESP32 fired its autonomous connect, so stop counting
             // deferrals for this MAC. This keeps the host fallback from racing
@@ -183,7 +192,7 @@ export class ReadingWatcher implements Watcher {
             });
           }
         } catch {
-          // Not JSON or missing fields — ignore (could be a host-initiated connect response)
+          bleLog.debug('Connected payload was not JSON, ignoring');
         }
         return;
       }
@@ -347,12 +356,13 @@ export class ReadingWatcher implements Watcher {
         bleLog.warn('gattInProgress stuck for >90s, auto-resetting');
         this.gattInProgress = false;
       } else {
-        bleLog.debug(`GATT connection already in progress, skipping ${entry.address}`);
+        bleLog.info(`GATT connection already in progress, skipping ${entry.address}`);
         return;
       }
     }
     this.gattInProgress = true;
     this.gattStartedAt = Date.now();
+    const seq = ++this.gattSessionSeq;
 
     const t = topics(this.config.topic_prefix, this.config.device_id);
     let client: MqttClient | undefined;
@@ -379,6 +389,7 @@ export class ReadingWatcher implements Watcher {
       bleLog.info(`Connecting via GATT proxy to ${adapter.name} (${entry.address})...`);
       const connected = await mqttGattConnect(client, t, entry.address, entry.addr_type ?? 0);
       device = connected.device;
+      this.currentDevice = device;
       const raw = await withTimeout(
         waitForRawReading(
           connected.charMap,
@@ -394,9 +405,13 @@ export class ReadingWatcher implements Watcher {
       this.queue.push(raw);
       this.deferCounts.delete(entry.address);
     } finally {
-      this.gattInProgress = false;
       device?.cleanup();
-      if (client) await mqttGattDisconnect(client, t).catch(() => {});
+      // A superseded session must not tear down the one that replaced it (#296).
+      if (seq === this.gattSessionSeq) {
+        this.gattInProgress = false;
+        this.currentDevice = null;
+        if (client) await mqttGattDisconnect(client, t).catch(() => {});
+      }
     }
   }
 
@@ -412,16 +427,19 @@ export class ReadingWatcher implements Watcher {
     chars: Array<{ uuid: string; properties: string[] }>;
   }): Promise<void> {
     if (this.gattInProgress) {
-      if (Date.now() - this.gattStartedAt > ReadingWatcher.GATT_STALE_MS) {
-        bleLog.warn('gattInProgress stuck for >90s, auto-resetting');
-        this.gattInProgress = false;
-      } else {
-        bleLog.debug(`GATT connection already in progress, skipping autonomous ${data.address}`);
-        return;
-      }
+      // Never skip an autonomous connect. The ESP32 holds exactly one BLE
+      // connection and disconnects before every auto-connect, so a newer
+      // autonomous event means the older session is already dead on the proxy;
+      // dropping it left the reporter with nothing happening for up to 90s
+      // while the stale-reset ran down (#296).
+      bleLog.warn(
+        `Newer autonomous connect for ${data.address} supersedes the in-flight GATT session`,
+      );
+      this.currentDevice?.fireDisconnect();
     }
     this.gattInProgress = true;
     this.gattStartedAt = Date.now();
+    const seq = ++this.gattSessionSeq;
 
     const t = topics(this.config.topic_prefix, this.config.device_id);
     let client: MqttClient | undefined;
@@ -480,6 +498,7 @@ export class ReadingWatcher implements Watcher {
       bleLog.info(`Autonomous GATT connect from ESP32: ${adapter.name} (${data.address})`);
       const { charMap, device: dev } = buildCharMapFromPayload(client, t, data.chars);
       device = dev;
+      this.currentDevice = device;
       bleLog.debug(
         `Autonomous connect: charMap built with ${charMap.size} chars, waiting for reading...`,
       );
@@ -501,9 +520,12 @@ export class ReadingWatcher implements Watcher {
       );
       this.queue.push(raw);
     } finally {
-      this.gattInProgress = false;
       device?.cleanup();
-      if (client) await mqttGattDisconnect(client, t).catch(() => {});
+      if (seq === this.gattSessionSeq) {
+        this.gattInProgress = false;
+        this.currentDevice = null;
+        if (client) await mqttGattDisconnect(client, t).catch(() => {});
+      }
     }
   }
 }

@@ -144,6 +144,15 @@ export interface EsphomeConnection {
     response: boolean,
   ): Promise<unknown>;
   notifyBluetoothGATTCharacteristicService(address: number, handle: number): Promise<unknown>;
+  /**
+   * ESPHome hardcodes response=true (ATT Write Request) for descriptor writes,
+   * so there is no `response` parameter here (#252).
+   */
+  writeBluetoothGATTDescriptorService(
+    address: number,
+    handle: number,
+    value: Uint8Array,
+  ): Promise<unknown>;
 }
 
 // ─── Client factory ──────────────────────────────────────────────────────────

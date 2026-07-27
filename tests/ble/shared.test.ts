@@ -539,6 +539,56 @@ describe('waitForReading() — multi-char mode (characteristics[])', () => {
     await expect(promise).resolves.toEqual(SAMPLE_BODY_COMP);
   });
 
+  it('continues when an optional notify binding cannot be subscribed (#229)', async () => {
+    // A characteristic being discovered says nothing about it being notifiable:
+    // the char map holds every discovered characteristic. A vendor char that is
+    // write-only on a sibling model must not fail the whole reading.
+    const char1 = createMockChar();
+    const optional = createMockChar();
+    optional.subscribe = async (): Promise<() => void> => {
+      throw new Error('Not permitted');
+    };
+    const device = createMockDevice();
+
+    const OPTIONAL_UUID = '0000fff200001000800000805f9b34fb';
+    const { charMap } = createCharMap([
+      [NOTIFY_UUID, char1],
+      [OPTIONAL_UUID, optional],
+    ]);
+
+    const adapter = createLegacyAdapter({
+      characteristics: [
+        { uuid: NOTIFY_UUID, type: 'notify' },
+        { uuid: OPTIONAL_UUID, type: 'notify', optional: true },
+      ],
+      onConnected: vi.fn(),
+      parseNotification: vi.fn(() => ({ weight: 75, impedance: 500 })),
+    });
+
+    const promise = waitForReading(charMap, device, adapter, PROFILE, '');
+    await vi.waitFor(() => expect(char1.subscribeCalled).toBe(true));
+    char1.triggerData(Buffer.from([0x01]));
+    await expect(promise).resolves.toEqual(SAMPLE_BODY_COMP);
+  });
+
+  it('still fails when a REQUIRED notify binding cannot be subscribed', async () => {
+    const char1 = createMockChar();
+    char1.subscribe = async (): Promise<() => void> => {
+      throw new Error('Not permitted');
+    };
+    const device = createMockDevice();
+    const { charMap } = createCharMap([[NOTIFY_UUID, char1]]);
+
+    const adapter = createLegacyAdapter({
+      characteristics: [{ uuid: NOTIFY_UUID, type: 'notify' }],
+      onConnected: vi.fn(),
+    });
+
+    await expect(waitForReading(charMap, device, adapter, PROFILE, '')).rejects.toThrow(
+      /Failed to enable notifications/,
+    );
+  });
+
   it('uses parseCharNotification when defined', async () => {
     const char1 = createMockChar();
     const device = createMockDevice();
@@ -1309,6 +1359,34 @@ describe('waitForReading() — adapter with no unlock wiring (#244)', () => {
     expect(result).toEqual(SAMPLE_BODY_COMP);
     // No legacy unlock write was issued.
     expect(writeChar.writtenData.length).toBe(0);
+  });
+
+  it('sends the unlock exactly once when unlockIntervalMs is 0', async () => {
+    // `?? 5000` does not catch 0, so this used to arm setInterval(fn, 0), which
+    // clamps to about 1 ms on Linux and floods the link for the whole session.
+    // Four adapters declare 0 (Active Era, ES-CS20M, Hesley, 1byone new).
+    const notifyChar = createMockChar();
+    const writeChar = createMockChar();
+    const device = createMockDevice();
+    const { charMap } = createCharMap([
+      [NOTIFY_UUID, notifyChar],
+      [WRITE_UUID, writeChar],
+    ]);
+
+    const adapter = createLegacyAdapter({
+      unlockCommand: [0xa5, 0x01],
+      unlockIntervalMs: 0,
+      parseNotification: (data: Buffer) =>
+        data[0] === 0x10 ? { weight: 75.5, impedance: 500 } : null,
+    });
+
+    const promise = waitForReading(charMap, device, adapter, PROFILE, '');
+    await vi.waitFor(() => expect(writeChar.writtenData.length).toBe(1));
+    await new Promise((r) => setTimeout(r, 60));
+    expect(writeChar.writtenData.length).toBe(1);
+
+    notifyChar.triggerData(Buffer.from([0x10]));
+    await expect(promise).resolves.toEqual(SAMPLE_BODY_COMP);
   });
 });
 

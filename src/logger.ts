@@ -12,6 +12,15 @@ export function setLogLevel(level: LogLevel): void {
   currentLevel = level;
 }
 
+/**
+ * Whether debug output is on. Lets a caller skip work whose only purpose is a
+ * debug line (for example extra D-Bus property reads), which the per-message
+ * level check inside the logger cannot avoid.
+ */
+export function isDebugEnabled(): boolean {
+  return currentLevel <= LogLevel.DEBUG;
+}
+
 export interface Logger {
   debug(msg: string): void;
   info(msg: string): void;
