@@ -1824,7 +1824,7 @@ describe('handler-mqtt-proxy', () => {
       expect(disconnectCalls.length).toBeGreaterThanOrEqual(1);
     });
 
-    it('ReadingWatcher skips autonomous connect when gattInProgress', async () => {
+    it('ReadingWatcher supersedes the in-flight session on a newer autonomous connect (#296)', async () => {
       const adapter = createGattAdapter();
       const config = { ...MQTT_PROXY_CONFIG, auto_connect: false };
       const watcher = new ReadingWatcher(config, [adapter], undefined, PROFILE);
@@ -1854,23 +1854,29 @@ describe('handler-mqtt-proxy', () => {
       // Clear mock call history before the autonomous connect attempt
       (mockClient.publishAsync as ReturnType<typeof vi.fn>).mockClear();
 
-      // Now simulate autonomous connect while GATT is in progress — should be skipped
+      // Autonomous connect while the previous GATT session is still open. The
+      // ESP32 holds one connection and disconnects before every auto-connect,
+      // so the older session is already dead on the proxy: the newer one must
+      // take over rather than be dropped (#296).
       mockClient._simulateMessage(
         `${PREFIX}/connected`,
         JSON.stringify({
           autonomous: true,
           address: 'BB:CC:DD:EE:FF:00',
-          chars: [{ uuid: GATT_NOTIFY_UUID, properties: ['notify'] }],
+          chars: [
+            { uuid: GATT_NOTIFY_UUID, properties: ['notify'] },
+            { uuid: GATT_WRITE_UUID, properties: ['write'] },
+          ],
         }),
       );
 
       await new Promise((r) => setTimeout(r, 50));
 
-      // No disconnect should have been published for the skipped autonomous connect
-      const disconnectCalls = (
+      // The new session engaged: it subscribed to the notify characteristic.
+      const subscribeCalls = (
         mockClient.publishAsync as ReturnType<typeof vi.fn>
-      ).mock.calls.filter((c: unknown[]) => c[0] === `${PREFIX}/disconnect`);
-      expect(disconnectCalls).toHaveLength(0);
+      ).mock.calls.filter((c: unknown[]) => String(c[0]).startsWith(`${PREFIX}/subscribe/`));
+      expect(subscribeCalls.length).toBeGreaterThanOrEqual(1);
     });
 
     it('combined scan/results then autonomous connected succeeds without race (#201)', async () => {

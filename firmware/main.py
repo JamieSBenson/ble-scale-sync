@@ -38,6 +38,16 @@ _busy = False
 # Pause autonomous scanning when a GATT connection is active
 _scan_paused = False
 
+# GATT session guard (#296). A session the host never engages with used to park
+# the scan loop until the ESP32 was reset: with lazy notify no notify reader is
+# running, and the notify reader is the only thing that reported a dead link.
+GATT_SESSION_IDLE_MS = getattr(board, "GATT_SESSION_IDLE_MS", 20000)
+GATT_SESSION_MAX_MS = getattr(board, "GATT_SESSION_MAX_MS", 180000)
+_gatt_session_task = None
+# Set the moment a 'connected' event is published, cleared when the session ends.
+_gatt_session_armed = False
+_last_host_activity = 0
+
 # Set True after on_connect finishes re-subscribing (avoids race with isconnected)
 _subs_ready = False
 
@@ -83,7 +93,7 @@ mqtt_config["queue_len"] = 0  # callback mode
 
 def on_message(topic_bytes, msg, retained):
     """Sync callback — queue the command for async processing."""
-    global _scale_macs, _auto_connect, _lazy_notify
+    global _scale_macs, _auto_connect, _lazy_notify, _last_host_activity
     t = topic_bytes.decode() if isinstance(topic_bytes, (bytes, bytearray)) else topic_bytes
     if t == topic("config"):
         try:
@@ -98,6 +108,8 @@ def on_message(topic_bytes, msg, retained):
         except Exception as e:
             print(f"Bad config payload: {e}")
         return
+    # Any host command counts as engagement with the current GATT session (#296).
+    _last_host_activity = time.ticks_ms()
     _pending.append((t, msg))
 
 
@@ -207,6 +219,53 @@ def _find_scale_in_raw(raw_results):
     return None
 
 
+async def _gatt_session_guard():
+    """End a GATT session the host never finishes, so scanning resumes (#296).
+
+    Gives up when the link is already down, when no host command has arrived for
+    GATT_SESSION_IDLE_MS, or when the session outlives GATT_SESSION_MAX_MS. The
+    recovery path is the existing unexpected-disconnect handler, reached through
+    the same callback the notify loop uses.
+    """
+    global _gatt_session_task
+    started = time.ticks_ms()
+    try:
+        while _scan_paused:
+            await asyncio.sleep_ms(1000)
+            # A BLE operation is in flight; it owns the session for now.
+            if _busy:
+                continue
+            if not _scan_paused:
+                return
+            now = time.ticks_ms()
+            reason = None
+            if not bridge.is_connected():
+                reason = "link is down"
+            elif time.ticks_diff(now, _last_host_activity) > GATT_SESSION_IDLE_MS:
+                reason = f"no host command for {GATT_SESSION_IDLE_MS}ms"
+            elif time.ticks_diff(now, started) > GATT_SESSION_MAX_MS:
+                reason = f"session exceeded {GATT_SESSION_MAX_MS}ms"
+            if reason:
+                print(f"GATT session guard: {reason}, ending session and resuming scan")
+                bridge.notify_disconnected()
+                return
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"GATT session guard error: {describe_exc(e)}")
+    finally:
+        _gatt_session_task = None
+
+
+def _arm_session_guard():
+    """Start the session guard for the session just published to the host."""
+    global _gatt_session_task, _gatt_session_armed, _last_host_activity
+    _gatt_session_armed = True
+    _last_host_activity = time.ticks_ms()
+    if _gatt_session_task is None:
+        _gatt_session_task = asyncio.create_task(_gatt_session_guard())
+
+
 async def _auto_gatt_connect(mac, addr_type):
     """Autonomously connect to a known scale and publish the connected event.
 
@@ -247,6 +306,7 @@ async def _auto_gatt_connect(mac, addr_type):
         result["autonomous"] = True
         result["address"] = mac
         await client.publish(topic("connected"), json.dumps(result), qos=0)
+        _arm_session_guard()
         print(f"Auto-connect to {mac} succeeded, {len(result['chars'])} chars published to host")
     except Exception as e:
         import sys
@@ -278,6 +338,12 @@ async def _streaming_scan_loop():
             await asyncio.sleep(1)
 
         if _scan_paused:
+            # Backstop for a paused scan with no guard running: only ever true
+            # for a session that was published to the host, so it cannot fire
+            # in the window where a connect has paused scanning but not yet
+            # taken _busy (#296).
+            if _gatt_session_armed and _gatt_session_task is None and not _busy:
+                await handle_unexpected_disconnect()
             await asyncio.sleep(1)
             continue
 
@@ -352,6 +418,9 @@ async def _batch_scan_loop():
 
         # Skip if a GATT connection is active or another BLE op is in progress
         if _scan_paused or _busy:
+            # Same backstop as the streaming loop (#296).
+            if _scan_paused and _gatt_session_armed and _gatt_session_task is None and not _busy:
+                await handle_unexpected_disconnect()
             await asyncio.sleep(1)
             continue
 
@@ -478,6 +547,7 @@ async def handle_connect(payload):
 
         bridge.set_on_disconnect(lambda: _pending.append(("__ble_disconnected__", b"")))
         await client.publish(topic("connected"), json.dumps(result), qos=0)
+        _arm_session_guard()
     except Exception as e:
         _scan_paused = False  # Resume scanning on connect failure
         if board.CONTINUOUS_SCAN:
@@ -489,7 +559,8 @@ async def handle_connect(payload):
 
 async def handle_disconnect():
     """Disconnect from BLE device and resume autonomous scanning."""
-    global _char_subscribed, _scan_paused
+    global _char_subscribed, _scan_paused, _gatt_session_armed
+    _gatt_session_armed = False
     await bridge.disconnect()
     _char_subscribed = False
     _scan_paused = False  # Resume autonomous scanning
@@ -499,8 +570,9 @@ async def handle_disconnect():
 
 
 async def handle_unexpected_disconnect():
-    """Handle unexpected BLE peripheral disconnect — notify TS, resume scanning."""
-    global _char_subscribed, _scan_paused
+    """Handle unexpected BLE peripheral disconnect, notify the host, resume scanning."""
+    global _char_subscribed, _scan_paused, _gatt_session_armed
+    _gatt_session_armed = False
     print("BLE peripheral disconnected unexpectedly")
     await bridge.disconnect()
     _char_subscribed = False

@@ -80,6 +80,14 @@ export class MqttBleDevice implements BleDevice {
     this.disconnectCb = callback;
   }
 
+  /**
+   * Abandon this session locally, as if the ESP32 had reported a disconnect.
+   * Used when a newer autonomous connect supersedes an in-flight one (#296).
+   */
+  fireDisconnect(): void {
+    this.disconnectCb?.();
+  }
+
   cleanup(): void {
     if (this.handler) this.client.removeListener('message', this.handler);
   }

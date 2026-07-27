@@ -44,6 +44,8 @@ The ESP32 scans autonomously for BLE advertisements and publishes results over M
 
 ::: tip Autonomous connect
 The ESP32 connects to known scales autonomously the instant it detects them, eliminating the MQTT round-trip that previously caused some fast-sleeping scales to power off before the connection could be established. This behavior is on by default. To disable it and use the old host-initiated connect flow, set `auto_connect: false` under `mqtt_proxy` in your config.
+
+Run the server in continuous mode with this handler. The ESP32 decides when to connect, and only the continuous-mode watcher stays subscribed to the `connected` topic; a single run listens only during its own scan window, so an autonomous connect that lands outside it is lost. Set `runtime.continuous_mode: true` (or `CONTINUOUS_MODE=true`). The server warns at startup if the mqtt-proxy handler is used without it.
 :::
 
 ## Supported Boards
@@ -419,6 +421,14 @@ Broadcast-only scales are unaffected and work on every board.
 ### A GATT-only scale never connects with auto_connect
 
 Some scales (for example the QN-Scale) expose no broadcast data and must be GATT-connected to read. With `auto_connect` on, the ESP32 connects itself the instant it sees a known scale MAC, but it only treats a MAC as known once the server has told it about that MAC. Set `ble.scale_mac` to your scale so the server seeds that MAC to the ESP32 at startup and the autonomous connect can fire on the first sighting. Without a `scale_mac`, the server still recovers by falling back to a slower host-initiated connect after a few scan cycles, so a configured `scale_mac` is recommended for GATT-only scales.
+
+### The ESP32 connects once per boot and then stops scanning
+
+The proxy pauses its scan for the duration of a GATT session, and a session used to end only when the server said so or when a notify reader saw the link drop. With lazy notify no reader runs until the server subscribes, so a session the server never engaged with left the scan paused until the ESP32 was reset: exactly one autonomous connect per boot.
+
+The firmware now guards every session it publishes. It ends the session and resumes scanning by itself when the link is already down, when no server command arrives for about 20 seconds, or when the session runs past three minutes, and prints the reason (`GATT session guard: ...`) on the serial console. Boards can tune this with `GATT_SESSION_IDLE_MS` and `GATT_SESSION_MAX_MS`.
+
+If the server did engage but the session still ends this way, the usual cause is a server not in continuous mode: see the autonomous-connect note above.
 
 ### A random-address scale times out on connect
 

@@ -245,6 +245,25 @@ class BleBridge:
         self._on_disconnect = callback
         self._disconnect_fired = False
 
+    def is_connected(self):
+        """True while the GATT link is up. Never raises."""
+        try:
+            return bool(self._conn and self._conn.is_connected())
+        except Exception:
+            return False
+
+    def notify_disconnected(self):
+        """Fire the disconnect callback once, from any producer.
+
+        With lazy notify the notify loop may never start, so it cannot be the
+        only path that reports a dead session (#296).
+        """
+        if self._disconnect_fired:
+            return
+        self._disconnect_fired = True
+        if self._on_disconnect:
+            self._on_disconnect()
+
     async def scan(self, duration_ms=None):
         """Scan for BLE peripherals using raw BLE API (batch mode).
 
@@ -628,10 +647,8 @@ class BleBridge:
             except Exception as e:
                 print(f"Notify loop error ({uuid_str}): {e}")
             # Fire disconnect callback once if connection was lost (not cancelled)
-            if not self._disconnect_fired and self._conn and not self._conn.is_connected():
-                self._disconnect_fired = True
-                if self._on_disconnect:
-                    self._on_disconnect()
+            if self._conn and not self._conn.is_connected():
+                self.notify_disconnected()
 
         task = asyncio.create_task(_notify_loop())
         self._notify_tasks.append(task)
