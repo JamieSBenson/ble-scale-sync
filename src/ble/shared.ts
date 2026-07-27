@@ -384,6 +384,16 @@ export function waitForRawReading(
     const handleNotification = (sourceUuid: string, data: Buffer): void => {
       if (resolved) return;
 
+      // Every frame the scale sends, before any adapter gate can discard it.
+      // Without this a silent cycle cannot be told apart from one where frames
+      // arrived and were rejected, which is the question every stalled-scale
+      // report ends up asking (#229).
+      bleLog.debug(
+        `Notification ${sourceUuid}: [${[...data.subarray(0, 32)]
+          .map((b) => b.toString(16).padStart(2, '0'))
+          .join(' ')}]${data.length > 32 ? ` (+${data.length - 32} bytes)` : ''}`,
+      );
+
       if (adapter.buildAck && ackWriteChar) {
         const ack = adapter.buildAck(data);
         if (ack) {

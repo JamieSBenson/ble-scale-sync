@@ -355,4 +355,181 @@ describe('BeurerBf720Adapter', () => {
       });
     });
   });
+
+  // #229: the Beurer app queries the vendor user list before the consent write
+  // and, once consent is accepted, reads the user data back, writes it
+  // unchanged and bumps the database change increment. Only after that commit
+  // does the scale send a body-composition frame with real values.
+  describe('post-consent user profile commit (#229)', () => {
+    const CHR_FFF2 = uuid16(0xfff2);
+    const CHR_FFF3 = uuid16(0xfff3);
+    const CHR_DOB = uuid16(0x2a85);
+    const CHR_GENDER = uuid16(0x2a8c);
+    const CHR_HEIGHT = uuid16(0x2a8e);
+    const CHR_DBINC = uuid16(0x2a99);
+
+    /** Characteristic set and stored values from the #229 BF788 capture. */
+    function bf788Ctx(over: Partial<ConnectionContext> = {}): ConnectionContext {
+      const stored: Record<string, Buffer> = {
+        [CHR_DBINC]: Buffer.from('06000000', 'hex'),
+        [CHR_DOB]: Buffer.from('bf070808', 'hex'),
+        [CHR_GENDER]: Buffer.from('00', 'hex'),
+        [CHR_HEIGHT]: Buffer.from('c000', 'hex'),
+        [CHR_FFF3]: Buffer.from('03', 'hex'),
+      };
+      return makeCtx({
+        availableChars: new Set([
+          CHR_WEIGHT,
+          CHR_BODYCOMP,
+          CHR_UCP,
+          CHR_FFF2,
+          CHR_FFF3,
+          CHR_DOB,
+          CHR_GENDER,
+          CHR_HEIGHT,
+          CHR_DBINC,
+        ]),
+        read: vi.fn(async (uuid: string) => stored[uuid] ?? Buffer.alloc(0)),
+        ...over,
+      });
+    }
+
+    const flush = async (): Promise<void> => {
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    };
+
+    it('queries the vendor user list between the time write and the consent write', async () => {
+      const a = makeAdapter();
+      const ctx = bf788Ctx();
+      await a.onConnected(ctx);
+
+      const write = ctx.write as ReturnType<typeof vi.fn>;
+      expect(write.mock.calls.map((c) => c[0])).toEqual([CHR_TIME, CHR_FFF2, CHR_UCP]);
+      expect(write.mock.calls[1][1]).toEqual([0x00]);
+    });
+
+    it('skips the vendor query when 0xFFF2 is absent', async () => {
+      const a = makeAdapter();
+      const ctx = makeCtx();
+      await a.onConnected(ctx);
+      const write = ctx.write as ReturnType<typeof vi.fn>;
+      expect(write.mock.calls.map((c) => c[0])).toEqual([CHR_TIME, CHR_UCP]);
+    });
+
+    it('still sends consent when the vendor query is rejected', async () => {
+      const a = makeAdapter();
+      const ctx = bf788Ctx({
+        write: vi.fn(async (uuid: string) => {
+          if (uuid === uuid16(0xfff2)) throw new Error('not permitted');
+        }),
+      });
+      await a.onConnected(ctx);
+      const write = ctx.write as ReturnType<typeof vi.fn>;
+      expect(write.mock.calls.map((c) => c[0])).toContain(CHR_UCP);
+    });
+
+    it('reads the user data back, writes it unchanged, then bumps the increment', async () => {
+      const a = makeAdapter();
+      const ctx = bf788Ctx();
+      await a.onConnected(ctx);
+      const write = ctx.write as ReturnType<typeof vi.fn>;
+      write.mockClear();
+
+      // Consent accepted: `20 02 01` on the User Control Point.
+      a.parseCharNotification(CHR_UCP, Buffer.from('200201', 'hex'));
+      await flush();
+
+      expect(
+        write.mock.calls.map((c) => [c[0], Buffer.from(c[1] as Buffer | number[]).toString('hex')]),
+      ).toEqual([
+        [CHR_DOB, 'bf070808'],
+        [CHR_GENDER, '00'],
+        [CHR_HEIGHT, 'c000'],
+        [CHR_FFF3, '03'],
+        [CHR_DBINC, '01000000'],
+      ]);
+    });
+
+    it('does not commit anything when consent is rejected', async () => {
+      const a = makeAdapter();
+      const ctx = bf788Ctx();
+      await a.onConnected(ctx);
+      const write = ctx.write as ReturnType<typeof vi.fn>;
+      write.mockClear();
+
+      a.parseCharNotification(CHR_UCP, Buffer.from('200205', 'hex'));
+      await flush();
+      expect(write).not.toHaveBeenCalled();
+    });
+
+    it('commits at most once per session', async () => {
+      const a = makeAdapter();
+      const ctx = bf788Ctx();
+      await a.onConnected(ctx);
+      const write = ctx.write as ReturnType<typeof vi.fn>;
+      write.mockClear();
+
+      a.parseCharNotification(CHR_UCP, Buffer.from('200201', 'hex'));
+      a.parseCharNotification(CHR_UCP, Buffer.from('200201', 'hex'));
+      a.parseCharNotification(CHR_UCP, Buffer.from('200201', 'hex'));
+      await flush();
+
+      const increments = write.mock.calls.filter((c) => c[0] === CHR_DBINC);
+      expect(increments).toHaveLength(1);
+    });
+
+    it('never writes into the previous session after a reconnect', async () => {
+      const a = makeAdapter();
+      const ctxA = bf788Ctx();
+      await a.onConnected(ctxA);
+      const ctxB = bf788Ctx();
+      await a.onConnected(ctxB);
+      (ctxA.write as ReturnType<typeof vi.fn>).mockClear();
+      (ctxB.write as ReturnType<typeof vi.fn>).mockClear();
+
+      a.parseCharNotification(CHR_UCP, Buffer.from('200201', 'hex'));
+      await flush();
+
+      expect(ctxA.write as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+      expect(ctxB.write as ReturnType<typeof vi.fn>).toHaveBeenCalled();
+    });
+
+    it('skips characteristics the scale does not expose', async () => {
+      const a = makeAdapter();
+      const ctx = bf788Ctx({
+        availableChars: new Set([CHR_WEIGHT, CHR_BODYCOMP, CHR_UCP, CHR_DOB, CHR_DBINC]),
+      });
+      await a.onConnected(ctx);
+      const write = ctx.write as ReturnType<typeof vi.fn>;
+      write.mockClear();
+
+      a.parseCharNotification(CHR_UCP, Buffer.from('200201', 'hex'));
+      await flush();
+
+      expect(write.mock.calls.map((c) => c[0])).toEqual([CHR_DOB, CHR_DBINC]);
+    });
+
+    it('a read failure never breaks the session', async () => {
+      const a = makeAdapter();
+      const ctx = bf788Ctx({
+        read: vi.fn(async () => {
+          throw new Error('Not authorized');
+        }),
+      });
+      await a.onConnected(ctx);
+
+      expect(() => a.parseCharNotification(CHR_UCP, Buffer.from('200201', 'hex'))).not.toThrow();
+      await flush();
+    });
+
+    it('decodes a vendor user-slot frame and emits no reading', () => {
+      const a = makeAdapter();
+      expect(
+        a.parseCharNotification(CHR_FFF2, Buffer.from('0001ffffffbf070808c00103', 'hex')),
+      ).toBeNull();
+      expect(a.parseCharNotification(CHR_FFF2, Buffer.from('01', 'hex'))).toBeNull();
+      expect(a.parseCharNotification(CHR_FFF2, Buffer.from('0001ff', 'hex'))).toBeNull();
+      expect(a.parseCharNotification(CHR_FFF2, Buffer.alloc(0))).toBeNull();
+    });
+  });
 });
