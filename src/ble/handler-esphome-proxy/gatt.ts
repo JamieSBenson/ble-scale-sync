@@ -82,7 +82,14 @@ export async function openGattSession(
   // session goes through one queue (#252).
   let queue: Promise<unknown> = Promise.resolve();
   const serial = <T>(fn: () => Promise<T>): Promise<T> => {
-    const next = queue.then(fn, fn);
+    // `closed` is checked when the unit actually runs, not when it is queued:
+    // close() does not drain the backlog, so anything still queued would
+    // otherwise be issued against a handle the session already disconnected,
+    // costing a 5 s library timeout each and stealing response events from the
+    // next session on the same shared connection.
+    const run = (): Promise<T> =>
+      closed ? Promise.reject(new Error('ESPHome GATT session closed')) : fn();
+    const next = queue.then(run, run);
     queue = next.then(
       () => undefined,
       () => undefined,
@@ -101,10 +108,17 @@ export async function openGattSession(
     };
   };
 
+  // A rejected GATT request is answered with BluetoothGATTErrorResponse, which
+  // the library never wires to the response it is awaiting, so the request only
+  // settles on its 5 s timeout. Waiters here turn that into an immediate
+  // rejection: five notify bindings on an unbonded proxy would otherwise be 25 s
+  // of dead air before the adapter handshake even starts.
+  const errorWaiters = new Map<number, (e: Error) => void>();
   track(GATT_ERROR_EVENT, (raw: unknown) => {
     const m = raw as { address: number; handle: number; error: number };
     if (m.address !== addr) return;
     bleLog.debug(`ESPHome GATT error: handle 0x${m.handle.toString(16)} status=${m.error}`);
+    errorWaiters.get(m.handle)?.(new Error(`ESPHome GATT status=${m.error}`));
   });
 
   // One log line per unexpected peer address for the whole session: every
@@ -154,33 +168,6 @@ export async function openGattSession(
           );
         },
         async subscribe(onData: (data: Buffer) => void): Promise<() => void> {
-          await serial(() => conn.notifyBluetoothGATTCharacteristicService(addr, handle));
-          // Registering with the proxy only routes notifications the ESP32
-          // receives; ESP-IDF requires the client to write the CCC descriptor
-          // before the peripheral sends any (#252). Register first so a
-          // notification fired the instant the CCCD lands is already routed.
-          const cccdValue = cccdValueFor(props);
-          if (cccdHandle !== undefined && cccdValue !== undefined) {
-            try {
-              await serial(() =>
-                conn.writeBluetoothGATTDescriptorService(addr, cccdHandle, cccdValue),
-              );
-              bleLog.debug(
-                `ESPHome CCCD write handle 0x${cccdHandle.toString(16)} = ${Buffer.from(
-                  cccdValue,
-                ).toString('hex')} for char 0x${handle.toString(16)}`,
-              );
-            } catch (e) {
-              // A scale that ignores the CCCD still gets the old behaviour.
-              bleLog.debug(
-                `ESPHome CCCD write failed for char 0x${handle.toString(16)}: ${errMsg(e)}`,
-              );
-            }
-          } else if (cccdHandle === undefined) {
-            bleLog.debug(
-              `ESPHome: no CCCD descriptor reported for char 0x${handle.toString(16)}; relying on the proxy registration alone`,
-            );
-          }
           const listener = (raw: unknown): void => {
             if (closed) return;
             const m = raw as EsphomeNotifyData;
@@ -213,7 +200,48 @@ export async function openGattSession(
               );
             }
           };
-          return track(NOTIFY_EVENT, listener);
+          // Register BEFORE anything that can make the peer notify. The library
+          // drains a whole TCP read synchronously, so a notification that shares
+          // a read with the CCCD write response is emitted before this function
+          // could resume: a scale that fires the instant its CCCD is written
+          // (QN 0x12, Robi S9, R-MSC04) would lose that first frame.
+          const untrack = track(NOTIFY_EVENT, listener);
+          try {
+            await serial(() => conn.notifyBluetoothGATTCharacteristicService(addr, handle));
+          } catch (e) {
+            untrack();
+            throw e;
+          }
+          // Registering with the proxy only routes notifications the ESP32
+          // receives; ESP-IDF requires the client to write the CCC descriptor
+          // before the peripheral sends any (#252).
+          const cccdValue = cccdValueFor(props);
+          if (cccdHandle !== undefined && cccdValue !== undefined) {
+            try {
+              await serial(() =>
+                Promise.race([
+                  conn.writeBluetoothGATTDescriptorService(addr, cccdHandle, cccdValue),
+                  new Promise<never>((_resolve, reject) => errorWaiters.set(cccdHandle, reject)),
+                ]).finally(() => errorWaiters.delete(cccdHandle)),
+              );
+              bleLog.debug(
+                `ESPHome CCCD write handle 0x${cccdHandle.toString(16)} = ${Buffer.from(
+                  cccdValue,
+                ).toString('hex')} for char 0x${handle.toString(16)}`,
+              );
+            } catch (e) {
+              // A scale that rejects or ignores the CCCD still gets the old
+              // behaviour: the proxy registration alone.
+              bleLog.debug(
+                `ESPHome CCCD write failed for char 0x${handle.toString(16)}: ${errMsg(e)}`,
+              );
+            }
+          } else if (cccdHandle === undefined) {
+            bleLog.debug(
+              `ESPHome: no CCCD descriptor reported for char 0x${handle.toString(16)}; relying on the proxy registration alone`,
+            );
+          }
+          return untrack;
         },
       };
       charMap.set(uuid, char);

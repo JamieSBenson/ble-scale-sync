@@ -509,6 +509,46 @@ describe('BeurerBf720Adapter', () => {
       expect(write.mock.calls.map((c) => c[0])).toEqual([CHR_DOB, CHR_DBINC]);
     });
 
+    it('still bumps the increment when one profile write is rejected', async () => {
+      // The increment is the step the scale actually waits for, so a read-only
+      // vendor characteristic on a sibling model must not cost us it.
+      const a = makeAdapter();
+      const ctx = bf788Ctx({
+        write: vi.fn(async (uuid: string) => {
+          if (uuid === uuid16(0xfff3)) throw new Error('write not permitted');
+        }),
+      });
+      await a.onConnected(ctx);
+      const write = ctx.write as ReturnType<typeof vi.fn>;
+      write.mockClear();
+
+      a.parseCharNotification(CHR_UCP, Buffer.from('200201', 'hex'));
+      await flush();
+
+      const last = write.mock.calls[write.mock.calls.length - 1];
+      expect(last[0]).toBe(CHR_DBINC);
+      expect(Buffer.from(last[1] as Buffer | number[]).toString('hex')).toBe('01000000');
+    });
+
+    it('still bumps the increment when one profile read is rejected', async () => {
+      const a = makeAdapter();
+      const ctx = bf788Ctx({
+        read: vi.fn(async (uuid: string) => {
+          if (uuid === uuid16(0x2a8e)) throw new Error('read not permitted');
+          return Buffer.from('00', 'hex');
+        }),
+      });
+      await a.onConnected(ctx);
+      const write = ctx.write as ReturnType<typeof vi.fn>;
+      write.mockClear();
+
+      a.parseCharNotification(CHR_UCP, Buffer.from('200201', 'hex'));
+      await flush();
+
+      expect(write.mock.calls.map((c) => c[0])).toContain(CHR_DBINC);
+      expect(write.mock.calls.map((c) => c[0])).not.toContain(uuid16(0x2a8e));
+    });
+
     it('a read failure never breaks the session', async () => {
       const a = makeAdapter();
       const ctx = bf788Ctx({

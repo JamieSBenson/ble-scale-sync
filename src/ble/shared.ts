@@ -218,11 +218,16 @@ function initializeAdapter(
       };
 
       sendUnlock();
-      // The `?? 5000` is a defensive default for the impossible-in-practice
-      // case of unlockCommands set without unlockIntervalMs; every real adapter
-      // that keeps Unlockable declares both. 5000 ms mirrors the predominant
-      // existing interval.
-      unlockInterval = setInterval(() => void sendUnlock(), adapter.unlockIntervalMs ?? 5000);
+      // `unlockIntervalMs: 0` means "send the unlock once", and four adapters
+      // declare exactly that (Active Era, ES-CS20M, Hesley, 1byone new). `??`
+      // does not catch 0, so they used to arm setInterval(fn, 0), which clamps
+      // to about 1 ms on Linux: a write flood for the whole session on every
+      // transport. The 5000 ms fallback stays for an adapter that declares
+      // unlockCommands without an interval at all.
+      const interval = adapter.unlockIntervalMs ?? 5000;
+      if (interval > 0) {
+        unlockInterval = setInterval(() => void sendUnlock(), interval);
+      }
     }
   };
 
@@ -260,6 +265,18 @@ async function subscribeAndInit(
         unsubscribers.push(unsub);
         subscribed += 1;
       } catch (err) {
+        // A characteristic being present says nothing about it being
+        // notifiable: the char map holds every discovered characteristic
+        // regardless of its properties. An optional binding must therefore
+        // tolerate a rejected subscribe exactly as it tolerates absence,
+        // otherwise one vendor characteristic that turns out to be write-only
+        // on a sibling model fails every reading on that model.
+        if (binding.optional) {
+          bleLog.debug(
+            `Optional notify binding ${binding.uuid} could not be enabled: ${errMsg(err)}`,
+          );
+          continue;
+        }
         // Name the exact characteristic that failed and surface the underlying
         // BlueZ error. Enabling notifications/indications on a SIG service that
         // mandates an encrypted link (e.g. Beurer BF720 User Data 0x181C) fails

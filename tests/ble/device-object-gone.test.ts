@@ -209,8 +209,30 @@ describe('connectWithRecovery: vanishing org.bluez.Device1 (#297)', () => {
       keepDiscoveryDuringConnect: true,
     });
 
-    // Only the post-connect stop.
+    // Only the post-connect stop, never the between-retries one.
     expect(btAdapter.stopDiscovery).toHaveBeenCalledTimes(1);
+    const stopOrder = btAdapter.stopDiscovery.mock.invocationCallOrder[0] ?? 0;
+    const connectOrder = reDiscovered.connect.mock.invocationCallOrder[0] ?? 0;
+    expect(connectOrder).toBeLessThan(stopOrder);
+  });
+
+  it('reports the vanished device object even when the last attempt failed differently', async () => {
+    const initial = makeDevice(async () => {
+      throw new Error(BLUETOOTHD_UNKNOWN_METHOD);
+    });
+    const reDiscovered = makeDevice(async () => {
+      throw new Error('Connection timed out');
+    });
+    const btAdapter = makeAdapter(reDiscovered);
+
+    await expect(
+      _internals.connectWithRecovery({
+        btAdapter: btAdapter as never,
+        mac: 'A0:85:61:91:E9:4F',
+        initialDevice: initial as never,
+        maxRetries: 1,
+      }),
+    ).rejects.toThrow(/keeps removing the D-Bus object/);
   });
 });
 

@@ -260,16 +260,28 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     if (!ctx || session !== this.session || this.profileSyncDone) return;
     this.profileSyncDone = true;
     try {
+      // Every read and write is isolated: only the BF788 is proven from a
+      // capture, and on a sibling model one locked-down or read-only
+      // characteristic must not cost us the increment below, which is the step
+      // the scale actually waits for.
       const values = new Map<string, Buffer>();
       for (const uuid of PROFILE_CHARS) {
         if (!ctx.availableChars.has(uuid)) continue;
         if (session !== this.session) return;
-        const value = await ctx.read(uuid);
-        if (value.length > 0) values.set(uuid, value);
+        try {
+          const value = await ctx.read(uuid);
+          if (value.length > 0) values.set(uuid, value);
+        } catch (err) {
+          bleLog.debug(`Beurer BF720: profile read ${uuid} rejected: ${String(err)}`);
+        }
       }
       for (const [uuid, value] of values) {
         if (session !== this.session) return;
-        await ctx.write(uuid, value, true);
+        try {
+          await ctx.write(uuid, value, true);
+        } catch (err) {
+          bleLog.debug(`Beurer BF720: profile write ${uuid} rejected: ${String(err)}`);
+        }
       }
       if (ctx.availableChars.has(CHR_DB_CHANGE_INCREMENT)) {
         if (session !== this.session) return;

@@ -46,6 +46,10 @@ GATT_SESSION_MAX_MS = getattr(board, "GATT_SESSION_MAX_MS", 180000)
 _gatt_session_task = None
 # Set the moment a 'connected' event is published, cleared when the session ends.
 _gatt_session_armed = False
+# True once the host has sent any command for the current session. A host that
+# has engaged is then silent by design while it waits for notifications, so the
+# idle timeout must never apply to it, only to a session nobody ever answered.
+_host_engaged = False
 _last_host_activity = 0
 
 # Set True after on_connect finishes re-subscribing (avoids race with isconnected)
@@ -93,7 +97,7 @@ mqtt_config["queue_len"] = 0  # callback mode
 
 def on_message(topic_bytes, msg, retained):
     """Sync callback — queue the command for async processing."""
-    global _scale_macs, _auto_connect, _lazy_notify, _last_host_activity
+    global _scale_macs, _auto_connect, _lazy_notify, _last_host_activity, _host_engaged
     t = topic_bytes.decode() if isinstance(topic_bytes, (bytes, bytearray)) else topic_bytes
     if t == topic("config"):
         try:
@@ -110,6 +114,8 @@ def on_message(topic_bytes, msg, retained):
         return
     # Any host command counts as engagement with the current GATT session (#296).
     _last_host_activity = time.ticks_ms()
+    if _gatt_session_armed:
+        _host_engaged = True
     _pending.append((t, msg))
 
 
@@ -241,8 +247,14 @@ async def _gatt_session_guard():
             reason = None
             if not bridge.is_connected():
                 reason = "link is down"
-            elif time.ticks_diff(now, _last_host_activity) > GATT_SESSION_IDLE_MS:
-                reason = f"no host command for {GATT_SESSION_IDLE_MS}ms"
+            elif (
+                not _host_engaged
+                and time.ticks_diff(now, _last_host_activity) > GATT_SESSION_IDLE_MS
+            ):
+                # Only a session the host never answered. Once it has subscribed
+                # and written its handshake it just listens, often for the whole
+                # weigh-in, so an idle timeout there would kill working setups.
+                reason = f"host never engaged within {GATT_SESSION_IDLE_MS}ms"
             elif time.ticks_diff(now, started) > GATT_SESSION_MAX_MS:
                 reason = f"session exceeded {GATT_SESSION_MAX_MS}ms"
             if reason:
@@ -259,11 +271,27 @@ async def _gatt_session_guard():
 
 def _arm_session_guard():
     """Start the session guard for the session just published to the host."""
-    global _gatt_session_task, _gatt_session_armed, _last_host_activity
+    global _gatt_session_task, _gatt_session_armed, _last_host_activity, _host_engaged
     _gatt_session_armed = True
+    _host_engaged = False
     _last_host_activity = time.ticks_ms()
     if _gatt_session_task is None:
         _gatt_session_task = asyncio.create_task(_gatt_session_guard())
+
+
+def _resume_scanning():
+    """Leave the GATT session state and restart autonomous scanning.
+
+    Clearing `_scan_paused` without clearing `_gatt_session_armed` would leave
+    the scan loops believing a session is live, so these always move together
+    (#296).
+    """
+    global _scan_paused, _gatt_session_armed, _host_engaged
+    _scan_paused = False
+    _gatt_session_armed = False
+    _host_engaged = False
+    if board.CONTINUOUS_SCAN:
+        bridge.start_streaming()
 
 
 async def _auto_gatt_connect(mac, addr_type):
@@ -313,9 +341,8 @@ async def _auto_gatt_connect(mac, addr_type):
 
         sys.print_exception(e)
         print(f"Auto-connect failed for {mac}: {describe_exc(e)}")
-        _scan_paused = False
+        _resume_scanning()
         if board.CONTINUOUS_SCAN:
-            bridge.start_streaming()
             print(f"Auto-connect: resumed streaming scan after failure")
         await publish_error(f"Auto-connect failed for {mac}: {describe_exc(e)}")
     finally:
@@ -516,7 +543,7 @@ async def handle_connect(payload):
     # host-initiated fallback connect (#231) re-enters aioble on the same bridge
     # concurrently, which can abort the connect mid-flight.
     if not await _wait_not_busy():
-        _scan_paused = False
+        _resume_scanning()
         await publish_error("Busy: another BLE operation is in progress")
         return
 
@@ -549,9 +576,7 @@ async def handle_connect(payload):
         await client.publish(topic("connected"), json.dumps(result), qos=0)
         _arm_session_guard()
     except Exception as e:
-        _scan_paused = False  # Resume scanning on connect failure
-        if board.CONTINUOUS_SCAN:
-            bridge.start_streaming()
+        _resume_scanning()  # Resume scanning on connect failure
         raise e
     finally:
         _busy = False
@@ -559,26 +584,20 @@ async def handle_connect(payload):
 
 async def handle_disconnect():
     """Disconnect from BLE device and resume autonomous scanning."""
-    global _char_subscribed, _scan_paused, _gatt_session_armed
-    _gatt_session_armed = False
+    global _char_subscribed
     await bridge.disconnect()
     _char_subscribed = False
-    _scan_paused = False  # Resume autonomous scanning
-    if board.CONTINUOUS_SCAN:
-        bridge.start_streaming()
+    _resume_scanning()  # Resume autonomous scanning
     await client.publish(topic("disconnected"), "", qos=0)
 
 
 async def handle_unexpected_disconnect():
     """Handle unexpected BLE peripheral disconnect, notify the host, resume scanning."""
-    global _char_subscribed, _scan_paused, _gatt_session_armed
-    _gatt_session_armed = False
+    global _char_subscribed
     print("BLE peripheral disconnected unexpectedly")
     await bridge.disconnect()
     _char_subscribed = False
-    _scan_paused = False
-    if board.CONTINUOUS_SCAN:
-        bridge.start_streaming()
+    _resume_scanning()
     await client.publish(topic("disconnected"), "", qos=0)
 
 

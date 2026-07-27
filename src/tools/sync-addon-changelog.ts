@@ -25,8 +25,13 @@ The add-on version always matches the application version, so every entry below
 applies to this add-on.
 `;
 
-export const ROOT_CHANGELOG_PATH = 'CHANGELOG.md';
-export const ADDON_CHANGELOG_PATH = path.join('ble-scale-sync-addon', 'CHANGELOG.md');
+// Anchored to the module rather than the cwd, so the CLI and the vitest guard
+// behave identically wherever they are invoked from.
+const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+export const ADDON_CHANGELOG_NAME = 'ble-scale-sync-addon/CHANGELOG.md';
+export const ROOT_CHANGELOG_PATH = path.join(REPO_ROOT, 'CHANGELOG.md');
+export const ADDON_CHANGELOG_PATH = path.join(REPO_ROOT, 'ble-scale-sync-addon', 'CHANGELOG.md');
+export const ADDON_CONFIG_PATH = path.join(REPO_ROOT, 'ble-scale-sync-addon', 'config.yaml');
 
 /** Strip the Keep a Changelog preamble and keep every release section verbatim. */
 export function buildAddonChangelog(rootChangelog: string): string {
@@ -39,23 +44,22 @@ export function buildAddonChangelog(rootChangelog: string): string {
 }
 
 function main(argv: string[]): void {
-  const root = readFileSync(path.resolve(process.cwd(), ROOT_CHANGELOG_PATH), 'utf8');
+  const root = readFileSync(ROOT_CHANGELOG_PATH, 'utf8');
   const generated = buildAddonChangelog(root);
-  const addonPath = path.resolve(process.cwd(), ADDON_CHANGELOG_PATH);
 
   if (argv.includes('check')) {
-    const current = readFileSync(addonPath, 'utf8').replace(/\r\n/g, '\n');
+    const current = readFileSync(ADDON_CHANGELOG_PATH, 'utf8').replace(/\r\n/g, '\n');
     if (current !== generated) {
-      console.error(`${ADDON_CHANGELOG_PATH} is stale. Run: npm run sync:addon-changelog`);
+      console.error(`${ADDON_CHANGELOG_NAME} is stale. Run: npm run sync:addon-changelog`);
       process.exitCode = 1;
       return;
     }
-    console.log(`${ADDON_CHANGELOG_PATH} is up to date`);
+    console.log(`${ADDON_CHANGELOG_NAME} is up to date`);
     return;
   }
 
-  writeFileSync(addonPath, generated, 'utf8');
-  console.log(`Wrote ${ADDON_CHANGELOG_PATH}`);
+  writeFileSync(ADDON_CHANGELOG_PATH, generated, 'utf8');
+  console.log(`Wrote ${ADDON_CHANGELOG_NAME}`);
 }
 
 // Only run as a CLI, so importing this module in tests has no side effects.

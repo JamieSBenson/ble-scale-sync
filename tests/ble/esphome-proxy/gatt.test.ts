@@ -280,6 +280,72 @@ describe('openGattSession', () => {
     await session.close();
   });
 
+  it('routes a notification emitted during the CCCD write round trip (#252)', async () => {
+    const conn = fakeConnection();
+    // The peer answers the CCCD write and notifies in the same drain: the
+    // library emits both synchronously, so a listener registered after the
+    // write would never see the first frame (QN 0x12, Robi S9, R-MSC04).
+    conn.writeBluetoothGATTDescriptorService = vi.fn(async () => {
+      conn.emit('message.BluetoothGATTNotifyDataResponse', {
+        address: ADDR,
+        handle: 7,
+        data: 'Eg==', // 0x12
+      });
+      return {};
+    });
+    const session = await openGattSession({ connection: conn } as never, '00:00:00:00:00:01');
+    const char = session.charMap.get(normalizeUuid('2a9d'))!;
+    const got: Buffer[] = [];
+    await char.subscribe((d) => got.push(d));
+    expect(got).toEqual([Buffer.from([0x12])]);
+    await session.close();
+  });
+
+  it('fails a rejected CCCD write immediately on the GATT error response (#252)', async () => {
+    const conn = fakeConnection();
+    // The library never resolves a descriptor write on an error response, so
+    // without the correlation it would only settle on its own 5s timeout.
+    conn.writeBluetoothGATTDescriptorService = vi.fn(() => {
+      setTimeout(
+        () =>
+          conn.emit('message.BluetoothGATTErrorResponse', { address: ADDR, handle: 8, error: 5 }),
+        0,
+      );
+      return new Promise(() => {});
+    });
+    const session = await openGattSession({ connection: conn } as never, '00:00:00:00:00:01');
+    const char = session.charMap.get(normalizeUuid('2a9d'))!;
+    const started = Date.now();
+    await expect(char.subscribe(() => {})).resolves.toBeTypeOf('function');
+    expect(Date.now() - started).toBeLessThan(1000);
+    await session.close();
+  });
+
+  it('does not issue queued requests after the session closed (#252)', async () => {
+    const conn = fakeConnection();
+    let release: (() => void) | undefined;
+    conn.writeBluetoothGATTCharacteristicService = vi.fn(async () => {
+      if (!release) {
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      }
+      return {};
+    });
+    const session = await openGattSession({ connection: conn } as never, '00:00:00:00:00:01');
+    const char = session.charMap.get(normalizeUuid('2a9d'))!;
+    const first = char.write(Buffer.from([1]), true);
+    const queued = [2, 3, 4].map((b) => char.write(Buffer.from([b]), true).catch(() => 'rejected'));
+    await new Promise((r) => setTimeout(r, 5));
+    await session.close();
+    release?.();
+    await first.catch(() => undefined);
+    await Promise.all(queued);
+    // Only the in-flight write reached the connection; the backlog rejected
+    // instead of being issued against a disconnected handle.
+    expect(conn.writeBluetoothGATTCharacteristicService).toHaveBeenCalledTimes(1);
+  });
+
   it('fires BleDevice.onDisconnect when the peer reports disconnected', async () => {
     const conn = fakeConnection();
     const session = await openGattSession({ connection: conn } as never, '00:00:00:00:00:01');

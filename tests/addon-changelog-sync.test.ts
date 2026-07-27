@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
+  ADDON_CHANGELOG_NAME,
   ADDON_CHANGELOG_PATH,
+  ADDON_CONFIG_PATH,
   ROOT_CHANGELOG_PATH,
   buildAddonChangelog,
 } from '../src/tools/sync-addon-changelog.js';
@@ -23,13 +25,13 @@ const addon = lf(readFileSync(ADDON_CHANGELOG_PATH, 'utf8'));
 
 describe('add-on changelog sync (#294)', () => {
   it('is the generated copy of the root changelog', () => {
-    expect(addon, `${ADDON_CHANGELOG_PATH} is stale. Run: npm run sync:addon-changelog`).toBe(
+    expect(addon, `${ADDON_CHANGELOG_NAME} is stale. Run: npm run sync:addon-changelog`).toBe(
       buildAddonChangelog(root),
     );
   });
 
   it('documents the version the add-on config reports', () => {
-    const config = lf(readFileSync('ble-scale-sync-addon/config.yaml', 'utf8'));
+    const config = lf(readFileSync(ADDON_CONFIG_PATH, 'utf8'));
     const version = /^version:\s*["']?([\d.]+)["']?\s*$/m.exec(config)?.[1];
     expect(version, 'no version in ble-scale-sync-addon/config.yaml').toBeDefined();
     const escaped = version!.replace(/\./g, '\\.');

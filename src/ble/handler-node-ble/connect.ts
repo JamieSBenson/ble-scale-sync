@@ -46,6 +46,7 @@ export async function connectWithRecovery(ctx: ConnectRecoveryContext): Promise<
   // deleting the peer's Device1 object while discovery is stopped (#297). Off
   // by default, so every other node-ble user takes the identical code path.
   let keepDiscovery = ctx.keepDiscoveryDuringConnect === true;
+  let sawObjectGone = false;
   // Long-lived PropertiesChanged subscription on the current device proxy so
   // every received advertisement updates the freshness clock. The tracker is
   // rebound when the catch branch swaps the device reference.
@@ -105,15 +106,18 @@ export async function connectWithRecovery(ctx: ConnectRecoveryContext): Promise<
         return device;
       } catch (err: unknown) {
         const msg = errMsg(err);
-        const objectGone = isDeviceObjectGone(err);
-        if (objectGone && !keepDiscovery) {
+        if (isDeviceObjectGone(err)) sawObjectGone = true;
+        if (sawObjectGone && !keepDiscovery) {
           keepDiscovery = true;
           bleLog.warn(
             `BlueZ removed the org.bluez.Device1 object for ${formattedMac} while discovery was stopped, so this peer is only visible while scanning is active. Retrying with discovery left running (#297).`,
           );
         }
         if (attempt >= maxRetries) {
-          if (objectGone) {
+          // Latched, not just the last error: once BlueZ has been caught
+          // dropping the object, that is the story worth telling even if the
+          // final attempt happened to time out instead.
+          if (sawObjectGone) {
             throw new Error(
               `Connection failed after ${maxRetries + 1} attempts: BlueZ keeps removing the D-Bus object for ${formattedMac}, so no GATT connection can be opened. The scale advertises but does not accept connections (broadcast only or non-discoverable). Last error: ${msg}`,
             );

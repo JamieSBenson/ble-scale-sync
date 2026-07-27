@@ -179,8 +179,36 @@ class SessionGuardTest(unittest.TestCase):
 
     def test_guard_ends_the_session_when_the_host_never_engages(self):
         main.GATT_SESSION_IDLE_MS = 0  # any elapsed time counts as idle
+        main._host_engaged = False
         asyncio.run(main._gatt_session_guard())
         self.assertEqual(self.bridge.fired, 1)
+
+    def test_guard_never_touches_a_session_the_host_engaged_with(self):
+        # The host subscribes and writes its handshake, then listens in silence
+        # for the rest of the weigh-in. An idle timeout there would abort every
+        # working mqtt-proxy reading that takes longer than the idle window.
+        main.GATT_SESSION_IDLE_MS = 0
+        main._host_engaged = True
+
+        async def scenario():
+            task = asyncio.create_task(main._gatt_session_guard())
+            await asyncio.sleep(1.3)
+            self.assertEqual(self.bridge.fired, 0)
+            task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_a_host_command_marks_the_armed_session_as_engaged(self):
+        main._gatt_session_armed = True
+        main._host_engaged = False
+        main.on_message(main.topic("subscribe/0000fff1").encode(), b"", False)
+        self.assertTrue(main._host_engaged)
+
+    def test_a_host_command_outside_a_session_does_not_mark_engagement(self):
+        main._gatt_session_armed = False
+        main._host_engaged = False
+        main.on_message(main.topic("connect").encode(), b"{}", False)
+        self.assertFalse(main._host_engaged)
 
     def test_guard_stays_armed_while_the_host_keeps_sending_commands(self):
         main.GATT_SESSION_IDLE_MS = 3000
@@ -240,6 +268,55 @@ class SessionGuardTest(unittest.TestCase):
 
     def test_host_disconnect_clears_the_armed_flag(self):
         asyncio.run(main.handle_disconnect())
+        self.assertFalse(main._gatt_session_armed)
+        self.assertFalse(main._scan_paused)
+
+    def test_resume_scanning_clears_scan_paused_and_armed_together(self):
+        # A resume path that cleared only _scan_paused left the scan loops
+        # believing a session was live: scanning then ran underneath the next
+        # GATT session and the backstop published a phantom disconnect.
+        main._scan_paused = True
+        main._gatt_session_armed = True
+        main._host_engaged = True
+        main._resume_scanning()
+        self.assertFalse(main._scan_paused)
+        self.assertFalse(main._gatt_session_armed)
+        self.assertFalse(main._host_engaged)
+        self.assertTrue(self.bridge.streaming)
+
+    def test_a_failed_host_connect_leaves_no_armed_session(self):
+        async def scenario():
+            self.bridge.connect = None  # attribute error inside handle_connect
+            main._gatt_session_armed = True
+            main._scan_paused = True
+            try:
+                await main.handle_connect(b'{"address": "AA:BB:CC:DD:EE:FF"}')
+            except Exception:
+                pass
+
+        asyncio.run(scenario())
+        self.assertFalse(main._gatt_session_armed)
+        self.assertFalse(main._scan_paused)
+
+    def test_a_busy_timeout_leaves_no_armed_session(self):
+        async def scenario():
+            main._busy = True
+            main._gatt_session_armed = True
+            main._scan_paused = True
+            await main.handle_connect(b'{"address": "AA:BB:CC:DD:EE:FF"}')
+
+        orig = main._wait_not_busy
+
+        async def never_free(*a, **k):
+            return False
+
+        main._wait_not_busy = never_free
+        try:
+            asyncio.run(scenario())
+        finally:
+            main._wait_not_busy = orig
+            main._busy = False
+
         self.assertFalse(main._gatt_session_armed)
         self.assertFalse(main._scan_paused)
 
