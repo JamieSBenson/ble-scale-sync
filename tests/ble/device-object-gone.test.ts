@@ -46,6 +46,26 @@ describe('isDeviceObjectGone() (#297)', () => {
     expect(isDeviceObjectGone(new Error(BLUETOOTHD_UNKNOWN_METHOD))).toBe(true);
   });
 
+  it('matches the bluetoothd UnknownObject shape naming a device path', () => {
+    // Bleak's BlueZ backend maps this exact error to "removed from BlueZ when
+    // scanning stopped", which is the same mechanism from another client.
+    expect(
+      isDeviceObjectGone(
+        new Error(
+          'org.freedesktop.DBus.Error.UnknownObject: Method "Connect" ... object path /org/bluez/hci0/dev_A0_85_61_91_E9_4F',
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it('does not match an UnknownObject error for an adapter or GATT child path', () => {
+    expect(
+      isDeviceObjectGone(
+        new Error('org.freedesktop.DBus.Error.UnknownObject: path /org/bluez/hci0'),
+      ),
+    ).toBe(false);
+  });
+
   it('does not match a GATT interface proxy error', () => {
     expect(
       isDeviceObjectGone(new Error('interface not found in proxy object: org.bluez.GattService1')),

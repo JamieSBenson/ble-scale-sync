@@ -19,11 +19,21 @@ import { extractDbusBytes } from './broadcast.js';
  *
  * Both branches key on the literal interface name so a GattService1 or
  * GattCharacteristic1 error can never match.
+ *
+ * A third shape comes from bluetoothd itself when the whole object path is
+ * gone: `org.freedesktop.DBus.Error.UnknownObject` naming a `/org/bluez/hciN/
+ * dev_XX_..` path. Bleak's BlueZ backend treats exactly that as "removed from
+ * BlueZ when scanning stopped", which is independent confirmation of the
+ * mechanism, so it is matched on the device path rather than the interface.
  */
 export function isDeviceObjectGone(err: unknown): boolean {
   const msg = errMsg(err);
-  if (!msg.includes('org.bluez.Device1')) return false;
-  return msg.includes('interface not found in proxy object') || msg.includes("doesn't exist");
+  if (msg.includes('org.bluez.Device1')) {
+    return msg.includes('interface not found in proxy object') || msg.includes("doesn't exist");
+  }
+  // Path-shaped variant: only ever a device node, never an adapter or a GATT
+  // child object, so it cannot swallow an unrelated failure.
+  return /UnknownObject/i.test(msg) && /\/org\/bluez\/hci\d+\/dev_[0-9A-Fa-f_]+/.test(msg);
 }
 
 /**
