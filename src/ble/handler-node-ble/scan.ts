@@ -43,6 +43,7 @@ import {
   stopDiscoveryAndQuiesce,
 } from './discovery.js';
 import { connectWithRecovery } from './connect.js';
+import { logAdvertisementSnapshot } from './device-object.js';
 import { wrapDevice, buildCharMap } from './gatt.js';
 import { broadcastScanNodeBle } from './broadcast.js';
 import { tagBleFailure, bleFailureKind } from '../failure-kind.js';
@@ -254,6 +255,9 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
 
       const name = await device.getName().catch(() => '');
       bleLog.debug(`Found device: ${name} [${mac}]`);
+      // Only chance to capture the advertisement: BlueZ drops it (and for some
+      // peers the whole Device object) once discovery stops (#297).
+      await logAdvertisementSnapshot(device);
 
       // Pre-connection adapter match (by name only). Needed for preferPassive adapters
       // so we can skip the GATT connect entirely and go straight to broadcast scanning.
@@ -341,6 +345,7 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
       device = result.device;
       matchedAdapter = result.adapter;
       deviceMac = result.mac;
+      await logAdvertisementSnapshot(device);
 
       // Passive-mode adapters: read from service-data advertisements without connecting.
       if (matchedAdapter.preferPassive && matchedAdapter.parseServiceData) {
