@@ -317,9 +317,9 @@ Releases are fully automated via [release-please](https://github.com/googleapis/
 
 Do not edit these files in a feature PR. If you need to correct the version or changelog, do it in the release PR before merging.
 
-### Files still maintained by hand
+### Generated companion files
 
-- `ble-scale-sync-addon/CHANGELOG.md` is the user-facing changelog shown inside the Home Assistant add-on UI. It benefits from a shorter, curated log, so release-please does not touch it. Update it in the release PR when user-facing add-on changes ship.
+- `ble-scale-sync-addon/CHANGELOG.md` is the changelog Home Assistant renders on the add-on page. It is generated from the root `CHANGELOG.md` by `src/tools/sync-addon-changelog.ts`; never edit it directly. After the root changelog changes (that is, in the release PR), run `npm run sync:addon-changelog` and commit the result. `tests/addon-changelog-sync.test.ts` fails the build while the copy is stale, which is how it fell 16 releases behind while it was maintained by hand (#294).
 - `docs/changelog.md` is a one-line VitePress include (`<!--@include: ../CHANGELOG.md-->`), so it updates automatically as soon as `CHANGELOG.md` does. Do not replace that include with hand-written content.
 
 ### Optional: `RELEASE_PLEASE_TOKEN` secret
