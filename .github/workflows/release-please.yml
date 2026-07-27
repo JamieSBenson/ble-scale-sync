@@ -57,8 +57,10 @@ jobs:
           fi
           # Explicit refspec: a shallow clone has no remote-tracking ref for
           # this branch, and a plain `fetch <branch>` only writes FETCH_HEAD.
+          # `checkout -B` rather than `switch --track`, because a ref fetched
+          # into a shallow clone is not a valid tracking start point.
           git fetch --depth 1 origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
-          git switch --track "origin/$BRANCH"
+          git checkout -B "$BRANCH" "refs/remotes/origin/$BRANCH"
           node src/tools/sync-addon-changelog.ts
           if git diff --quiet -- ble-scale-sync-addon/CHANGELOG.md; then
             echo "Add-on changelog already in sync."
