@@ -168,6 +168,20 @@ If a GATT scale still does not produce readings:
   scale's advertisement) with every GATT connect, and falls back to the other
   type if the first attempt is refused. Update to the latest version if you
   still see this on older builds.
+- **The scale connects and is written to, then stays silent:** resolved. The
+  proxy's notify registration only routes notifications the ESP32 receives; the
+  0x2902 descriptor still has to be written for the scale to send any, and that
+  write was missing, so strict firmware (QN, Renpho) never streamed a byte
+  ([#252](https://github.com/KristianP26/ble-scale-sync/issues/252)). A related
+  bug decoded every GATT payload as empty
+  ([#291](https://github.com/KristianP26/ble-scale-sync/issues/291)). Both are
+  fixed; with `debug: true` you now get a `cccd=` line per characteristic and an
+  explicit `ESPHome CCCD write ...` line.
+- **The scale needs a bonded or encrypted link:** the ESPHome proxy does not
+  bond, so a scale that demands encryption for its notifications (the Beurer
+  BF7xx consent family, for example) cannot be read over this transport. With
+  debug on it shows as `ESPHome GATT error: handle 0x.. status=5` (or `15`)
+  right after the CCCD write. Those scales need the native Linux BlueZ path.
 
 ### Multiple ESPHome proxies (mesh)
 
