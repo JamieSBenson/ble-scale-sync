@@ -167,6 +167,7 @@ BlueZPairingAgent.configureMembers({
 let agentInstance: BlueZPairingAgent | null = null;
 let registered = false;
 let defaultAgentClaimed = false;
+let defaultAgentUnavailable = false;
 /**
  * Application state, not connection state, so forgetPairingAgent() must NOT
  * clear it: resetConnection() also runs mid-cycle and the very next
@@ -200,7 +201,7 @@ export function setPairingTarget(provider: PairingTargetProvider): void {
 export async function ensurePairingAgent(bus: MessageBus): Promise<void> {
   if (!agentInstance) agentInstance = new BlueZPairingAgent();
   agentInstance.setTargetProvider(targetProvider);
-  const wantDefault = targetProvider().pin !== undefined;
+  const wantDefault = targetProvider().pin !== undefined && !defaultAgentUnavailable;
   if (registered && (defaultAgentClaimed || !wantDefault)) return;
 
   try {
@@ -225,6 +226,12 @@ export async function ensurePairingAgent(bus: MessageBus): Promise<void> {
         defaultAgentClaimed = true;
         bleLog.debug('BlueZ default-agent role claimed (a consent PIN is configured)');
       } catch (err) {
+        // Latch after the first failure. Another agent already holding the role
+        // is a persistent host state, not a transient one, so retrying every
+        // scan cycle would warn forever in continuous mode without ever
+        // succeeding. Registration itself stands, so pairings we initiate are
+        // still answered.
+        defaultAgentUnavailable = true;
         bleLog.warn(
           `BlueZ RequestDefaultAgent failed: ${errMsg(err)}. A bonded scale that ` +
             're-requests pairing confirmation may still stall in service discovery (#83).',
@@ -303,4 +310,5 @@ export function forgetPairingAgent(): void {
   agentInstance = null;
   registered = false;
   defaultAgentClaimed = false;
+  defaultAgentUnavailable = false;
 }
