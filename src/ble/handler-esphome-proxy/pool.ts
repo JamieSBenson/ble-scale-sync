@@ -14,6 +14,23 @@ import { openGattSession, type GattSession } from './gatt.js';
 /** A sighting kept fresh for this long counts toward proxy selection. */
 const SIGHTING_TTL_MS = 60_000;
 
+/** How often the advertisement-liveness sweep runs. */
+const LIVENESS_CHECK_MS = 30_000;
+
+/**
+ * Backoff after a rebuild. The first rung must exceed LIVENESS_CHECK_MS, or the
+ * recomputed deadline lands on the next sweep tick and the rung is a no-op.
+ */
+const REBUILD_BACKOFF_MS = [60_000, 120_000, 240_000, 300_000];
+
+/**
+ * Successful rebuilds that still produced no advertisement before giving up.
+ * Guards the documented case where rebuilding cannot help: a proxy already
+ * adopted by Home Assistant serves only one advertisement subscription, so we
+ * would reconnect cleanly and still hear nothing, forever.
+ */
+const MAX_INEFFECTIVE_REBUILDS = 3;
+
 export interface ProxyEndpoint {
   id: string; // `${host}:${port}`
   host: string;
@@ -66,8 +83,39 @@ export class EsphomeProxyPool {
   private subscribers = new Set<AdvertCb>();
   private started = false;
 
-  constructor(config: EsphomeProxyConfig) {
+  // --- advertisement liveness (#303) ---
+  /** proxyId -> timestamp of the last advertisement seen from it. */
+  private lastAdAt = new Map<string, number>();
+  /** proxyId -> open or opening GATT sessions; never tear one of these down. */
+  private gattInFlight = new Map<string, number>();
+  private rebuilding = new Set<string>();
+  private rebuildAttempts = new Map<string, number>();
+  private ineffectiveRebuilds = new Map<string, number>();
+  private livenessTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly advertisementTimeoutMs: number;
+  private readonly livenessEnabled: boolean;
+
+  constructor(config: EsphomeProxyConfig, opts: { liveness?: boolean } = {}) {
     this.endpoints = endpointsFromConfig(config);
+    this.advertisementTimeoutMs = (config.advertisement_timeout ?? 0) * 1000;
+    // One-shot pools (npm run scan, a single read) are bounded by their own
+    // caller, so a liveness timer there would only leak a handle.
+    this.livenessEnabled = opts.liveness !== false;
+  }
+
+  /**
+   * Register that a GATT session is opening or open on this proxy. The sweep
+   * must never tear down a client while a session is bound to its connection,
+   * and an active session is itself proof the transport is alive.
+   */
+  noteGattStart(proxyId: string): void {
+    this.gattInFlight.set(proxyId, (this.gattInFlight.get(proxyId) ?? 0) + 1);
+  }
+
+  noteGattEnd(proxyId: string): void {
+    const n = (this.gattInFlight.get(proxyId) ?? 1) - 1;
+    if (n <= 0) this.gattInFlight.delete(proxyId);
+    else this.gattInFlight.set(proxyId, n);
   }
 
   async start(): Promise<void> {
@@ -81,18 +129,36 @@ export class EsphomeProxyPool {
         password: ep.password,
         client_info: ep.client_info,
         additional_proxies: [],
+        advertisement_timeout: 0,
       } as EsphomeProxyConfig);
       const handler = (ad: EsphomeBleAdvertisement): void => this.onAd(ep.id, ad);
       client.on('ble', handler);
       this.clients.set(ep.id, client);
       this.adHandlers.set(ep.id, handler);
       await waitForConnected(client, ep.id);
+      this.lastAdAt.set(ep.id, Date.now());
       bleLog.info(`ESPHome proxy connected at ${ep.id}`);
+    }
+    if (this.livenessEnabled && this.advertisementTimeoutMs > 0) {
+      bleLog.info(
+        `ESPHome advertisement watchdog armed (${this.advertisementTimeoutMs / 1000}s of silence rebuilds the client)`,
+      );
+      this.livenessTimer = setInterval(() => void this.sweepLiveness(), LIVENESS_CHECK_MS);
+      this.livenessTimer.unref?.();
     }
   }
 
   async stop(): Promise<void> {
     if (!this.started) return;
+    // First, not last: rebuildClient re-checks `started` after each await, and a
+    // late clear leaves a window where a rebuilt client is inserted into an
+    // already-cleared map, never disconnected, and keeps its own reconnect loop
+    // and timers alive for the rest of the process.
+    this.started = false;
+    if (this.livenessTimer) {
+      clearInterval(this.livenessTimer);
+      this.livenessTimer = null;
+    }
     for (const [id, client] of this.clients) {
       const handler = this.adHandlers.get(id);
       if (handler) client.removeListener('ble', handler as (...args: unknown[]) => void);
@@ -102,7 +168,100 @@ export class EsphomeProxyPool {
     this.adHandlers.clear();
     this.sightings.clear();
     this.addressTypes.clear();
-    this.started = false;
+    this.lastAdAt.clear();
+    this.gattInFlight.clear();
+    this.rebuilding.clear();
+    this.rebuildAttempts.clear();
+    this.ineffectiveRebuilds.clear();
+  }
+
+  /**
+   * Rebuild any proxy client that has not delivered a single advertisement for
+   * `advertisement_timeout`. A home proxy always sees some BLE traffic, so a
+   * long silence means the transport died rather than that the house is quiet
+   * (#303, #281).
+   */
+  private async sweepLiveness(): Promise<void> {
+    const now = Date.now();
+    for (const ep of this.endpoints) {
+      if (!this.started) return;
+      if (this.rebuilding.has(ep.id)) continue;
+      if ((this.ineffectiveRebuilds.get(ep.id) ?? 0) >= MAX_INEFFECTIVE_REBUILDS) continue;
+      // An open or opening GATT session binds its charMap and notify listeners
+      // to this client's connection, and is itself proof of life.
+      if ((this.gattInFlight.get(ep.id) ?? 0) > 0) {
+        this.lastAdAt.set(ep.id, now);
+        continue;
+      }
+      const last = this.lastAdAt.get(ep.id) ?? now;
+      const silentMs = now - last;
+      const rung = Math.min(this.rebuildAttempts.get(ep.id) ?? 0, REBUILD_BACKOFF_MS.length - 1);
+      const threshold = Math.max(this.advertisementTimeoutMs, REBUILD_BACKOFF_MS[rung]);
+      if (silentMs < threshold) continue;
+      bleLog.warn(
+        `ESPHome proxy ${ep.id}: no BLE advertisement for ${Math.round(silentMs / 1000)}s ` +
+          `(threshold ${Math.round(threshold / 1000)}s). Rebuilding the client (#303).`,
+      );
+      await this.rebuildClient(ep);
+    }
+  }
+
+  private async rebuildClient(ep: ProxyEndpoint): Promise<void> {
+    this.rebuilding.add(ep.id);
+    try {
+      const old = this.clients.get(ep.id);
+      const oldHandler = this.adHandlers.get(ep.id);
+      if (old && oldHandler) {
+        old.removeListener('ble', oldHandler as (...args: unknown[]) => void);
+      }
+      // safeDisconnect now guarantees connection.disconnect(), which releases
+      // the node's single advertisement-subscription slot before we reconnect.
+      if (old) await safeDisconnect(old);
+      this.clients.delete(ep.id);
+      this.adHandlers.delete(ep.id);
+      if (!this.started) return;
+
+      const client = await createEsphomeClient({
+        host: ep.host,
+        port: ep.port,
+        encryption_key: ep.encryption_key,
+        password: ep.password,
+        client_info: ep.client_info,
+        additional_proxies: [],
+        advertisement_timeout: 0,
+      } as EsphomeProxyConfig);
+      const handler = (ad: EsphomeBleAdvertisement): void => this.onAd(ep.id, ad);
+      client.on('ble', handler);
+      await waitForConnected(client, ep.id);
+      if (!this.started) {
+        await safeDisconnect(client);
+        return;
+      }
+      this.clients.set(ep.id, client);
+      this.adHandlers.set(ep.id, handler);
+      this.lastAdAt.set(ep.id, Date.now());
+      this.rebuildAttempts.set(ep.id, (this.rebuildAttempts.get(ep.id) ?? 0) + 1);
+      // Counted until an advertisement actually arrives; onAd clears it. A
+      // rebuild that reconnects cleanly and still hears nothing is the
+      // adopted-proxy case, where retrying forever helps nobody.
+      this.ineffectiveRebuilds.set(ep.id, (this.ineffectiveRebuilds.get(ep.id) ?? 0) + 1);
+      if ((this.ineffectiveRebuilds.get(ep.id) ?? 0) >= MAX_INEFFECTIVE_REBUILDS) {
+        bleLog.warn(
+          `ESPHome proxy ${ep.id}: rebuilt ${MAX_INEFFECTIVE_REBUILDS} times without a single ` +
+            'advertisement. Giving up on the watchdog for this proxy. If it is adopted by Home ' +
+            'Assistant, it serves only one advertisement subscription and cannot be shared.',
+        );
+      }
+      bleLog.info(`ESPHome proxy ${ep.id} rebuilt after advertisement silence`);
+    } catch (err) {
+      this.rebuildAttempts.set(ep.id, (this.rebuildAttempts.get(ep.id) ?? 0) + 1);
+      bleLog.warn(
+        `ESPHome proxy ${ep.id} rebuild failed: ${errMsg(err)}. Will retry with backoff.`,
+      );
+      this.lastAdAt.set(ep.id, Date.now());
+    } finally {
+      this.rebuilding.delete(ep.id);
+    }
   }
 
   /** Subscribe to merged advertisements from all proxies. Returns unsubscribe. */
@@ -127,9 +286,24 @@ export class EsphomeProxyPool {
     for (const id of order) {
       const client = this.clients.get(id);
       if (!client) continue;
+      // Hold the liveness sweep off this proxy for the whole session: its
+      // charMap and notify listeners are bound to this client's connection, so
+      // a rebuild underneath would silently break an in-progress weigh-in.
+      this.noteGattStart(id);
       try {
-        return await openGattSession(client, mac, addressType);
+        const session = await openGattSession(client, mac, addressType);
+        const close = session.close.bind(session);
+        let released = false;
+        session.close = async (): Promise<void> => {
+          if (!released) {
+            released = true;
+            this.noteGattEnd(id);
+          }
+          await close();
+        };
+        return session;
       } catch (e) {
+        this.noteGattEnd(id);
         errors.push(`${id}: ${errMsg(e)}`);
       }
     }
@@ -191,6 +365,11 @@ export class EsphomeProxyPool {
   }
 
   private onAd(proxyId: string, ad: EsphomeBleAdvertisement): void {
+    // Liveness is "is the pipe alive", not "is this advertisement useful", so
+    // record it before any filtering.
+    this.lastAdAt.set(proxyId, Date.now());
+    this.ineffectiveRebuilds.delete(proxyId);
+    this.rebuildAttempts.delete(proxyId);
     const mac = formatMacAddress(ad.address);
     if (mac === '00:00:00:00:00:00') return;
     const now = Date.now();

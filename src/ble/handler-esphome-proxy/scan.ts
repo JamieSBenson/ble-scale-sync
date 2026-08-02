@@ -56,7 +56,7 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
 
   const { targetMac, adapters } = opts;
   const targetLc = targetMac?.toLowerCase();
-  const pool = new EsphomeProxyPool(config);
+  const pool = new EsphomeProxyPool(config, { liveness: false });
 
   // Boxed so TS does not narrow it to `never` in the finally (it is only
   // assigned inside the Promise executor callback).
@@ -198,7 +198,7 @@ export async function scanDevices(
   config: EsphomeProxyConfig,
 ): Promise<ScanResult[]> {
   const duration = durationMs ?? SCAN_DEFAULT_MS;
-  const pool = new EsphomeProxyPool(config);
+  const pool = new EsphomeProxyPool(config, { liveness: false });
   const results = new Map<string, ScanResult>();
 
   try {

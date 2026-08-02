@@ -61,9 +61,22 @@ ble:
     encryption_key: '${ESPHOME_API_KEY}' # 32-byte base64 PSK from your api: config
     # password: '${ESPHOME_API_PASSWORD}' # legacy plaintext auth, use encryption_key instead
     client_info: ble-scale-sync # visible in ESPHome logs / Home Assistant
+    advertisement_timeout: 0 # seconds of BLE silence before the client is rebuilt; 0 = off
 ```
 
 Restart BLE Scale Sync. In continuous mode the server keeps the Native API connection open, subscribes once, and processes advertisements as they arrive.
+
+### Recovering a transport that dies silently
+
+The Native API client can die without saying so. A single `read ECONNRESET` has been observed to leave the transport dead for over four hours while the ESP32 itself stayed healthy and reachable, the container stayed running, and the log produced nothing at all. Weigh-ins in that window are simply lost, and only a restart brings it back ([#303](https://github.com/KristianP26/ble-scale-sync/issues/303)).
+
+Two things help.
+
+The client lifecycle is now logged at info level: `connected`, `disconnected`, `initialized` (which is the positive confirmation that the BLE advertisement subscription actually came back, not just that a socket exists) and any scheduled reconnect. If the transport dies you will see it stop rather than having to infer it from silence.
+
+`advertisement_timeout` arms a watchdog. A proxy in a normal home sees some BLE traffic constantly, so if no advertisement at all arrives from a given proxy for this many seconds, its client is torn down and rebuilt with backoff. It is **off by default** (`0`), because a rebuild is a real teardown and there is one setup where it fires without helping: a proxy already adopted by Home Assistant serves only a single advertisement subscription, so the rebuild succeeds and advertisements still never arrive. The watchdog gives up on a proxy after three rebuilds that produce nothing, and never tears down a proxy while a GATT session is open on it.
+
+If you have seen the silence in your own log, `180` to `600` is a sensible value.
 
 ### Getting the encryption key
 
