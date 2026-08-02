@@ -12,9 +12,12 @@ services:
       - NET_RAW
 
     # Add the bluetooth group so the container can access BLE devices.
-    # Find the correct GID on your host: getent group bluetooth | cut -d: -f3
+    # Compose cannot run a subshell, so set BLUETOOTH_GID in a .env file next to
+    # this compose file, or replace the default below. Find it on your host with:
+    #   getent group bluetooth | cut -d: -f3
+    # Commonly 112 on Debian/Ubuntu and 103 on Raspberry Pi OS.
     group_add:
-      - '112'
+      - '${BLUETOOTH_GID:-112}'
 
     # Required for Tier 5 BLE recovery (rfkill block/unblock) when BlueZ
     # enters a stuck discovery state on Broadcom adapters (RPi). Harmless

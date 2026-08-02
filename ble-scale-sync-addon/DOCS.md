@@ -86,7 +86,9 @@ Add-on v1.8.1 bumps `garminconnect` to 0.3.x, which uses a new native auth engin
 
 ## Advanced: Custom Config
 
-For advanced setups (multi-user, additional exporters like InfluxDB/Webhook/Ntfy/Telegram/Intervals.icu/Strava/File, or alternative BLE transports), enable **Use custom config.yaml** and place your configuration at:
+The Configuration tab covers the scale, the primary user profile, MQTT and Garmin Connect. Every other exporter (InfluxDB, Webhook, Ntfy, Telegram, Intervals.icu, Strava, Runalyze, Wger, File), every multi-user setup and the alternative BLE transports are configured through a custom `config.yaml`. See the [exporters reference](https://blescalesync.dev/exporters) for each one's options.
+
+To use one, enable **Use custom config.yaml** and place your configuration at:
 
 ```
 /share/ble-scale-sync/config.yaml

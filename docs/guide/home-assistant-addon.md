@@ -173,7 +173,7 @@ User-supplied files live under `/share/ble-scale-sync/`:
 
    ```bash
    docker run --rm -it --network host --cap-add NET_ADMIN --cap-add NET_RAW \
-     --group-add 112 -v /var/run/dbus:/var/run/dbus:ro \
+     --group-add "$(getent group bluetooth | cut -d: -f3)" -v /var/run/dbus:/var/run/dbus:ro \
      --security-opt apparmor=unconfined \
      ghcr.io/kristianp26/ble-scale-sync:latest scan
    ```

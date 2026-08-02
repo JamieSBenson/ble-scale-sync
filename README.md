@@ -26,7 +26,7 @@ If you can't have a Pi next to your scale, a cheap **ESP32 proxy** can sit nearb
 ```bash
 # Configure
 docker run --rm -it --network host --cap-add NET_ADMIN --cap-add NET_RAW \
-  --group-add 112 -v /var/run/dbus:/var/run/dbus:ro \
+  --group-add "$(getent group bluetooth | cut -d: -f3)" -v /var/run/dbus:/var/run/dbus:ro \
   -v ./config.yaml:/app/config.yaml \
   -v ./garmin-tokens:/app/garmin-tokens \
   ghcr.io/kristianp26/ble-scale-sync:latest setup
@@ -34,7 +34,7 @@ docker run --rm -it --network host --cap-add NET_ADMIN --cap-add NET_RAW \
 # Run (continuous mode, auto-restart)
 docker run -d --restart unless-stopped --network host \
   --cap-add NET_ADMIN --cap-add NET_RAW \
-  --group-add 112 --device /dev/rfkill \
+  --group-add "$(getent group bluetooth | cut -d: -f3)" --device /dev/rfkill \
   -v /var/run/dbus:/var/run/dbus:ro \
   -v ./config.yaml:/app/config.yaml:ro \
   -v ./garmin-tokens:/app/garmin-tokens:ro \
