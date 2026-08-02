@@ -9,9 +9,10 @@ import type {
   UserProfile,
   BodyComposition,
   AdapterRuntimeConfig,
+  MultiCharNotify,
 } from '../interfaces/scale-adapter.js';
 import { uuid16 } from './body-comp-helpers.js';
-import { bleLog, errMsg } from '../ble/types.js';
+import { bleLog, errMsg, normalizeUuid } from '../ble/types.js';
 import type { MatchDescriptor } from './match-descriptor.js';
 import type { WeightUnit } from '../config/schema.js';
 
@@ -125,7 +126,9 @@ const MAX_STORED_RECORD_AGE_SEC = 90;
 const MAX_STORED_QUERY_ATTEMPTS = 6;
 const STORED_QUERY_RETRY_MS = 3000;
 
-export class QnScaleAdapter implements ScaleAdapterCore, GattWiring, BroadcastSource {
+export class QnScaleAdapter
+  implements ScaleAdapterCore, GattWiring, BroadcastSource, MultiCharNotify
+{
   readonly name = 'QN Scale';
   readonly match: MatchDescriptor = {
     priority: 250,
@@ -162,6 +165,17 @@ export class QnScaleAdapter implements ScaleAdapterCore, GattWiring, BroadcastSo
 
   /** Whether the AE00 service is available (newer firmware). */
   private hasAe00 = false;
+
+  /**
+   * In-flight AE02 subscribe, shared by onConnected and the 0x12 state machine.
+   * Both used to fire because `hasAe00` is only set after the await, and every
+   * subscribe adds another notification listener, so each AE02 frame was
+   * dispatched four times (#75).
+   */
+  private ae02Subscribe: Promise<boolean> | null = null;
+
+  /** Whether an AE00 challenge frame has already been reported this session. */
+  private ae00ChallengeSeen = false;
 
   /**
    * Whether the scale sent a long-frame (18-byte) 0x12 variant (e.g. ES-26M).
@@ -258,6 +272,8 @@ export class QnScaleAdapter implements ScaleAdapterCore, GattWiring, BroadcastSo
     this.seenProtocolType = 0x00;
     this.weightScaleFactor = 100;
     this.hasAe00 = false;
+    this.ae02Subscribe = null;
+    this.ae00ChallengeSeen = false;
     this.isLongFrameVariant = false;
     this.firstStableNoImpedanceAt = null;
     this.sessionStartedScaleSeconds = Math.floor(Date.now() / 1000) - SCALE_EPOCH_OFFSET;
@@ -277,16 +293,11 @@ export class QnScaleAdapter implements ScaleAdapterCore, GattWiring, BroadcastSo
     // Try subscribing to AE02 (newer firmware detection).
     // NOTE: on Linux, 0x12 may arrive before this completes. The state machine
     // handlers do NOT depend on hasAe00; they always attempt AE01 writes
-    // (which fail silently on older firmware without AE00).
-    try {
-      await ctx.subscribe(CHR_AE02);
-      this.hasAe00 = true;
-      bleLog.debug('QN: subscribed to AE02');
-    } catch {
-      bleLog.debug('QN: AE02 not available (older firmware)');
-    }
+    // (which fail silently on older firmware without AE00). Both paths go
+    // through the same memoised helper so they cannot subscribe twice (#75).
+    const hasAe02 = await this.ensureAe02Subscribed();
 
-    if (!this.hasAe00) {
+    if (!hasAe02) {
       // Older firmware: send legacy unlock variants on FFF2.
       // These work with Renpho, Sencor, and generic QN-Scale devices
       // that don't use the notification-driven handshake.
@@ -447,6 +458,86 @@ export class QnScaleAdapter implements ScaleAdapterCore, GattWiring, BroadcastSo
    * State machine writes are fire-and-forget (async, not awaited) so they
    * don't block the synchronous parseNotification return.
    */
+  /**
+   * Subscribe to AE02 at most once per session. Concurrent callers share the
+   * same in-flight promise. A rejection clears the memo so a later, sequential
+   * caller can still retry, which preserves the second attempt from the state
+   * machine without reinstating the concurrent double-subscribe.
+   */
+  private async ensureAe02Subscribed(): Promise<boolean> {
+    const ctx = this.ctx;
+    if (!ctx) return false;
+    if (this.hasAe00) return true;
+    if (!this.ae02Subscribe) {
+      this.ae02Subscribe = ctx.subscribe(CHR_AE02).then(
+        () => {
+          this.hasAe00 = true;
+          bleLog.debug('QN: subscribed to AE02');
+          return true;
+        },
+        () => {
+          this.ae02Subscribe = null;
+          bleLog.debug('QN: AE02 not available (older firmware)');
+          return false;
+        },
+      );
+    }
+    return this.ae02Subscribe;
+  }
+
+  /**
+   * Multi-char dispatch. FFF1 (or FFE1 on Type 1) carries the QN vendor
+   * protocol. AE02 carries the AE00 challenge, a different frame family with no
+   * QN opcode and no QN checksum, which parseNotification logged as `QN RAW` as
+   * if it were a vendor frame and then dropped at the `opcode !== 0x10` gate.
+   *
+   * Only the positively identified challenge shape is intercepted: 17 bytes
+   * whose first byte is 0x00. That byte is the one position identical across all
+   * three #75 samples while the remaining 16 are high entropy, so it is the AE00
+   * header rather than payload. Suppressing exactly that shape is
+   * behaviour-identical to today, because parseNotification already returns null
+   * for opcode 0x00. Anything else on AE02 still falls through to the unchanged
+   * parser, so no scale that currently gets a reading over AE02 can lose it.
+   * #75 / #235.
+   */
+  parseCharNotification(charUuid: string, data: Buffer): ScaleReading | null {
+    if (normalizeUuid(charUuid) === CHR_AE02) {
+      bleLog.debug(`QN AE02 (${data.length}B): [${hex(data)}]`);
+      if (this.isAe00Challenge(data)) {
+        this.noteAe00Challenge();
+        return null;
+      }
+    }
+    return this.parseNotification(data);
+  }
+
+  /** Signature of the AE00 challenge as captured in #75: 17 bytes, header 0x00. */
+  private isAe00Challenge(data: Buffer): boolean {
+    return data.length === 17 && data[0] === 0x00;
+  }
+
+  /**
+   * Record the AE00 challenge once per session. No response is sent: the #75
+   * capture contains one challenge and no observed response, which is
+   * information-theoretically insufficient to derive one, and fifteen guessable
+   * AES-128 keys were tried and rejected. Shipping a guess would be worse than
+   * shipping nothing.
+   *
+   * Logged at debug rather than warn on purpose: the AE00 service is also
+   * present on Renpho ES-CS20M firmware that reads fine, so a warning on every
+   * successful session would be a regression.
+   */
+  private noteAe00Challenge(): void {
+    if (this.ae00ChallengeSeen) return;
+    this.ae00ChallengeSeen = true;
+    bleLog.debug(
+      'QN: AE00 challenge frame received on AE02 and no response is sent. Scales that ' +
+        'gate measurement frames behind this challenge then stay silent on FFF1. If this ' +
+        'session produces no weight, attach an HCI snoop of the vendor app completing one ' +
+        'weigh-in to #235 so the response can be decoded.',
+    );
+  }
+
   parseNotification(data: Buffer): ScaleReading | null {
     if (data.length < 3) return null;
 
@@ -646,17 +737,10 @@ export class QnScaleAdapter implements ScaleAdapterCore, GattWiring, BroadcastSo
 
     const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-    // Step 1: Subscribe AE02 if not already done (may not have happened yet
-    // on Linux where 0x12 arrives before onConnected finishes AE02 subscribe).
-    if (!this.hasAe00 && this.ctx) {
-      try {
-        await this.ctx.subscribe(CHR_AE02);
-        this.hasAe00 = true;
-        bleLog.debug('QN: subscribed to AE02 (from state machine)');
-      } catch {
-        // AE02 not available (older firmware)
-      }
-    }
+    // Step 1: subscribe AE02 if it has not happened yet. On Linux 0x12 can
+    // arrive before onConnected finishes, so both paths call the same memoised
+    // helper instead of racing two independent subscribes (#75).
+    await this.ensureAe02Subscribed();
 
     // Step 2: AE01 init. Fails silently on firmware without AE00.
     await this.writeAe01([0xfe, 0xdc, 0xba, 0xc0, 0x06, 0x00, 0x02, 0x01, 0x01, 0xef]);
