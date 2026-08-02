@@ -29,6 +29,7 @@ import { helperOf, getDbusNext, type Adapter, type Device } from './dbus.js';
 import {
   getAdapter,
   getBus,
+  attachBusErrorHandler,
   resetConnection,
   isStaleConnectionError,
   isDbusConnectionError,
@@ -527,6 +528,13 @@ export async function scanDevices(
     if (isDbusConnectionError(err)) throw dbusError();
     throw err;
   }
+
+  // This session owns its own bus, so it needs its own error listener or a
+  // socket failure here is an uncaught exception (#290). No latch: the function
+  // is one-shot and its finally block tears the session down.
+  attachBusErrorHandler(bluetooth, (err) =>
+    bleLog.warn(`D-Bus transport error during scan: ${errMsg(err)}`),
+  );
 
   let btAdapter: Adapter | null = null;
 

@@ -14,9 +14,43 @@ import { forgetPairingAgent } from './agent.js';
 let persistentConn: { bluetooth: NodeBle.Bluetooth; destroy: () => void } | null = null;
 let persistentAdapter: Adapter | null = null;
 
+/** Latched when the D-Bus transport errors. Cleared by resetConnection(). */
+let busFailed = false;
+
+/**
+ * Attach a permanent `error` listener to a node-ble session's MessageBus.
+ *
+ * dbus-next forwards raw socket errors from `connection.js` to `bus.js`, and
+ * MessageBus is an EventEmitter, so with no listener Node turns the first one
+ * into an uncaught exception and the process dies. A reporter running the
+ * container against an unreachable D-Bus socket hit exactly that: `write EPIPE`
+ * thrown from `dbus-next/lib/bus.js`, exit code 1, restart loop (#290).
+ *
+ * Recovery deliberately does not run inside the handler: MessageBus.disconnect()
+ * ends the underlying stream, and doing that synchronously from a stream error
+ * handler risks reentrant emits. Callers latch and rebuild at a safe point.
+ */
+export function attachBusErrorHandler(
+  bluetooth: NodeBle.Bluetooth,
+  onError: (err: unknown) => void,
+): void {
+  try {
+    const bus = (bluetooth as unknown as { dbus: MessageBus }).dbus;
+    bus.on('error', onError);
+  } catch (err) {
+    bleLog.debug(`Could not attach D-Bus error handler: ${errMsg(err)}`);
+  }
+}
+
 export function getConnection(): { bluetooth: NodeBle.Bluetooth; destroy: () => void } {
   if (!persistentConn) {
     persistentConn = NodeBle.createBluetooth();
+    attachBusErrorHandler(persistentConn.bluetooth, (err) => {
+      busFailed = true;
+      bleLog.warn(
+        `D-Bus transport error: ${errMsg(err)}. The connection will be rebuilt before the next scan.`,
+      );
+    });
     bleLog.debug('D-Bus connection established');
   }
   return persistentConn;
@@ -33,6 +67,10 @@ export function getBus(): MessageBus {
 }
 
 export async function getAdapter(bleAdapter?: string): Promise<Adapter> {
+  if (busFailed) {
+    bleLog.warn('Rebuilding the D-Bus connection after a transport error');
+    resetConnection();
+  }
   const conn = getConnection();
   if (!persistentAdapter) {
     if (bleAdapter) {
@@ -46,6 +84,7 @@ export async function getAdapter(bleAdapter?: string): Promise<Adapter> {
 }
 
 export function resetConnection(): void {
+  busFailed = false;
   persistentAdapter = null;
   if (persistentConn) {
     // Destroying the connection makes BlueZ drop our pairing agent (owner gone),
@@ -69,7 +108,12 @@ export function isStaleConnectionError(err: unknown): boolean {
     msg.includes('not found in proxy') ||
     msg.includes('connection closed') ||
     msg.includes('The name is not activatable') ||
-    msg.includes('was not provided')
+    msg.includes('was not provided') ||
+    // dbus-next transport failures. A caught variant routes into the existing
+    // reset-and-retry rather than surfacing as an opaque scan failure (#290).
+    msg.includes('stream is closed') ||
+    msg.includes('closed stream') ||
+    msg.includes('EPIPE')
   );
 }
 

@@ -229,6 +229,14 @@ export const bleStep: WizardStep = {
         try {
           const NodeBle = await import('node-ble');
           const { bluetooth, destroy } = NodeBle.default.createBluetooth();
+          // An async D-Bus socket error is emitted on the MessageBus, not thrown
+          // from the await, so the surrounding try/catch would not see it and the
+          // process would die with an uncaught exception (#290).
+          const { attachBusErrorHandler } =
+            await import('../../ble/handler-node-ble/connection.js');
+          attachBusErrorHandler(bluetooth, () => {
+            /* enumeration falls through to manual entry */
+          });
           try {
             availableAdapters = await bluetooth.adapters();
           } finally {

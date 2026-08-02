@@ -40,6 +40,21 @@ export const CHAR_DISCOVERY_RETRY_DELAY_MS = 500;
 export const POST_DISCOVERY_QUIESCE_MS = 500;
 
 /**
+ * Hard ceiling on one native poll cycle.
+ *
+ * The worst legitimate node-ble cycle is roughly 575 s (discovery 120 + six
+ * connect attempts 170 + GATT acquisition 30 + characteristic retries + reading
+ * 120), so 900 s never fires on a healthy run.
+ *
+ * It exists because dbus-next never rejects an in-flight `MessageBus.call()`
+ * when the socket dies: the resolver is stored in `_methodReturnHandlers` and is
+ * only ever read when a reply arrives, so a broken D-Bus transport parks the
+ * cycle forever. Without a deadline the consecutive-failure watchdog is never
+ * reached and a dead transport looks exactly like an idle house (#290).
+ */
+export const POLL_CYCLE_TIMEOUT_MS = 900_000;
+
+/**
  * Minimum cooldown floor after a successful read in continuous mode.
  * BLE scales typically keep advertising for 15-25 s after the user steps off
  * (display goes dark, link layer winds down). Connecting during that tail-off
