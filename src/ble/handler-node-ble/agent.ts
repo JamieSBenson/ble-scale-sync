@@ -31,6 +31,16 @@ export const AGENT_CAPABILITY = 'KeyboardDisplay';
 /** Provider for the current consent/pairing PIN (beurer_pin). May change on reload. */
 type PinProvider = () => number | undefined;
 
+/** The scale this cycle is pairing with, so unrelated peers cannot use its PIN. */
+export interface PairingTarget {
+  /** users[0].beurer_pin, or undefined when none is configured. */
+  pin?: number;
+  /** ble.scale_mac, or undefined in auto-discovery mode. */
+  mac?: string;
+}
+
+export type PairingTargetProvider = () => PairingTarget;
+
 /**
  * org.bluez.Agent1 implementation. Supplies the configured PIN for Passkey/PIN
  * entry and accepts the confirmation/authorization association models. A missing
@@ -38,18 +48,47 @@ type PinProvider = () => number | undefined;
  * the bond cleanly and the adapter's "set beurer_pin" guard can surface instead.
  */
 export class BlueZPairingAgent extends dbusNext.interface.Interface {
-  private pinProvider: PinProvider = () => undefined;
+  private targetProvider: PairingTargetProvider = () => ({});
 
   constructor() {
     super('org.bluez.Agent1');
   }
 
+  /** Back-compat shim: a target with no MAC means "no MAC gate". */
   setPinProvider(provider: PinProvider): void {
-    this.pinProvider = provider;
+    this.targetProvider = () => ({ pin: provider() });
   }
 
-  private requirePin(method: string): number {
-    const pin = this.pinProvider();
+  setTargetProvider(provider: PairingTargetProvider): void {
+    this.targetProvider = provider;
+  }
+
+  /**
+   * True when `device` is the configured scale, or when no scale_mac is set
+   * (auto-discovery, where we cannot tell). BlueZ paths look like
+   * /org/bluez/hciN/dev_AA_BB_CC_DD_EE_FF.
+   */
+  private isTarget(device: string): boolean {
+    const mac = this.targetProvider().mac;
+    if (!mac) return true;
+    const want = mac.replace(/[^0-9a-fA-F]/g, '').toUpperCase();
+    if (want.length !== 12) return true;
+    const m = /dev_([0-9A-Fa-f_]+)$/.exec(device);
+    if (!m) return true;
+    return m[1].replace(/_/g, '').toUpperCase() === want;
+  }
+
+  private decline(method: string, device: string): never {
+    bleLog.warn(
+      `BlueZ pairing agent: ${method} for ${device} is not the configured scale ` +
+        '(ble.scale_mac); declining so an unrelated device cannot use the scale PIN.',
+    );
+    throw new dbusNext.DBusError('org.bluez.Error.Rejected', 'Not the configured scale');
+  }
+
+  private requirePin(method: string, device: string): number {
+    if (!this.isTarget(device)) this.decline(method, device);
+    const pin = this.targetProvider().pin;
     if (pin == null) {
       bleLog.warn(
         `BlueZ pairing agent: ${method} requested but no beurer_pin is configured; ` +
@@ -66,7 +105,7 @@ export class BlueZPairingAgent extends dbusNext.interface.Interface {
 
   RequestPinCode(device: string): string {
     bleLog.debug(`BlueZ agent: RequestPinCode for ${device}`);
-    return String(this.requirePin('RequestPinCode'));
+    return String(this.requirePin('RequestPinCode', device));
   }
 
   DisplayPinCode(device: string, pincode: string): void {
@@ -75,22 +114,31 @@ export class BlueZPairingAgent extends dbusNext.interface.Interface {
 
   RequestPasskey(device: string): number {
     bleLog.debug(`BlueZ agent: RequestPasskey for ${device}`);
-    return this.requirePin('RequestPasskey');
+    return this.requirePin('RequestPasskey', device);
   }
 
   DisplayPasskey(device: string, passkey: number, entered: number): void {
-    bleLog.debug(`BlueZ agent: DisplayPasskey ${passkey} (entered ${entered}) for ${device}`);
+    // BlueZ-generated, not the user's secret, so safe to log at info.
+    bleLog.info(`BlueZ agent: DisplayPasskey ${passkey} (entered ${entered}) for ${device}`);
   }
 
+  /**
+   * Logged at info deliberately. This single line is the smoking gun for #83:
+   * its presence proves the whole chain fired, its absence proves BlueZ never
+   * asked us and the scale stalled for some other reason.
+   */
   RequestConfirmation(device: string, passkey: number): void {
-    bleLog.debug(`BlueZ agent: RequestConfirmation ${passkey} for ${device} -> accept`);
+    if (!this.isTarget(device)) this.decline('RequestConfirmation', device);
+    bleLog.info(`BlueZ agent: RequestConfirmation ${passkey} for ${device} -> accepted`);
   }
 
   RequestAuthorization(device: string): void {
+    if (!this.isTarget(device)) this.decline('RequestAuthorization', device);
     bleLog.debug(`BlueZ agent: RequestAuthorization for ${device} -> accept`);
   }
 
   AuthorizeService(device: string, uuid: string): void {
+    if (!this.isTarget(device)) this.decline('AuthorizeService', device);
     bleLog.debug(`BlueZ agent: AuthorizeService ${uuid} for ${device} -> accept`);
   }
 
@@ -118,6 +166,87 @@ BlueZPairingAgent.configureMembers({
 // refreshed across scan cycles / config reloads.
 let agentInstance: BlueZPairingAgent | null = null;
 let registered = false;
+let defaultAgentClaimed = false;
+/**
+ * Application state, not connection state, so forgetPairingAgent() must NOT
+ * clear it: resetConnection() also runs mid-cycle and the very next
+ * getAdapter() still has to know which scale it is pairing with.
+ */
+let targetProvider: PairingTargetProvider = () => ({});
+
+/** Publish the current cycle's pairing target. Called once per scan cycle. */
+export function setPairingTarget(provider: PairingTargetProvider): void {
+  targetProvider = provider;
+  agentInstance?.setTargetProvider(provider);
+}
+
+/**
+ * Register the pairing agent on this bus using the ambient target (idempotent).
+ *
+ * Called for every fresh D-Bus connection, regardless of bond state. The old
+ * code only reached registerPairingAgent() from inside ensureBonded(), which
+ * returns early when the device is already paired, so a bonded scale that
+ * re-negotiates security on reconnect had no agent to answer
+ * RequestConfirmation. BlueZ then never resolved services and gatt() timed out
+ * after 30s, which is exactly #83: a background bluetoothctl agent confirming
+ * the passkey made the very next attempt succeed end to end.
+ *
+ * The default-agent role is claimed ONLY when a consent PIN is configured.
+ * Claiming it unconditionally would take the system-wide role away from
+ * whatever agent the host already runs, and our requirePin() rejects a passkey
+ * request it cannot answer, so a PIN-less install could end up worse off than
+ * with no agent at all.
+ */
+export async function ensurePairingAgent(bus: MessageBus): Promise<void> {
+  if (!agentInstance) agentInstance = new BlueZPairingAgent();
+  agentInstance.setTargetProvider(targetProvider);
+  const wantDefault = targetProvider().pin !== undefined;
+  if (registered && (defaultAgentClaimed || !wantDefault)) return;
+
+  try {
+    if (!registered) {
+      bus.export(AGENT_PATH, agentInstance);
+    }
+    const bluez = await bus.getProxyObject('org.bluez', '/org/bluez');
+    const manager = bluez.getInterface('org.bluez.AgentManager1');
+    if (!registered) {
+      try {
+        await manager.RegisterAgent(AGENT_PATH, AGENT_CAPABILITY);
+      } catch (err) {
+        // Re-registering the same path returns AlreadyExists; treat as success.
+        if (!errMsg(err).includes('AlreadyExists')) throw err;
+      }
+      registered = true;
+      bleLog.debug(`BlueZ pairing agent registered (${AGENT_CAPABILITY})`);
+    }
+    if (wantDefault && !defaultAgentClaimed) {
+      try {
+        await manager.RequestDefaultAgent(AGENT_PATH);
+        defaultAgentClaimed = true;
+        bleLog.debug('BlueZ default-agent role claimed (a consent PIN is configured)');
+      } catch (err) {
+        bleLog.warn(
+          `BlueZ RequestDefaultAgent failed: ${errMsg(err)}. A bonded scale that ` +
+            're-requests pairing confirmation may still stall in service discovery (#83).',
+        );
+      }
+    } else if (!wantDefault) {
+      bleLog.debug('Not claiming the BlueZ default-agent role (no users[].beurer_pin configured)');
+    }
+  } catch (err) {
+    bleLog.warn(
+      `Could not register BlueZ pairing agent: ${errMsg(err)}. ` +
+        'Pairing will rely on any system agent that is present.',
+    );
+    if (!registered && agentInstance) {
+      try {
+        bus.unexport(AGENT_PATH, agentInstance);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
 
 /**
  * Register our pairing agent on the given bus (idempotent). Always refreshes the
@@ -173,4 +302,5 @@ export async function registerPairingAgent(
 export function forgetPairingAgent(): void {
   agentInstance = null;
   registered = false;
+  defaultAgentClaimed = false;
 }

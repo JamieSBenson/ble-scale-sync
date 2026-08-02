@@ -2,7 +2,7 @@ import NodeBle from 'node-ble';
 import type { MessageBus } from 'dbus-next';
 import { bleLog, errMsg } from '../types.js';
 import type { Adapter } from './dbus.js';
-import { forgetPairingAgent } from './agent.js';
+import { forgetPairingAgent, ensurePairingAgent } from './agent.js';
 
 /**
  * Persistent D-Bus connection + adapter, reused across scan cycles in
@@ -80,6 +80,14 @@ export async function getAdapter(bleAdapter?: string): Promise<Adapter> {
       persistentAdapter = await conn.bluetooth.defaultAdapter();
     }
   }
+  // Every fresh D-Bus connection passes through here, and every resetConnection()
+  // call site is immediately followed by a getAdapter(), so this is the one
+  // choke point that re-arms the pairing agent after a reset, in both single-run
+  // and continuous mode. Registering here rather than inside ensureBonded() is
+  // the whole point: ensureBonded returns early for an already-bonded device, so
+  // a scale that re-negotiates security on reconnect never got an agent (#83).
+  // Best-effort by design; a failure logs and falls back to any system agent.
+  await ensurePairingAgent(getBus());
   return persistentAdapter;
 }
 
