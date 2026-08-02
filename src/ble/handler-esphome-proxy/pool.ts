@@ -208,6 +208,17 @@ export class EsphomeProxyPool {
 
   private async rebuildClient(ep: ProxyEndpoint): Promise<void> {
     this.rebuilding.add(ep.id);
+    // Hoisted so the catch can tear the replacement down. Left inside the try
+    // they were unreachable on the failure path, and a half-built client does
+    // not stay quietly broken: the library is constructed with reconnect:true,
+    // so it revives on its own, re-runs subscribeBluetoothAdvertisementService
+    // and starts emitting 'ble' into a handler for an endpoint that is no
+    // longer in this.clients. onAd would then refresh liveness forever (so the
+    // watchdog never fires again) while connectGatt skips the endpoint for
+    // having no client (so every GATT read fails), and stop() would never
+    // disconnect it because it iterates this.clients.
+    let client: EsphomeClient | undefined;
+    let handler: ((ad: EsphomeBleAdvertisement) => void) | undefined;
     try {
       const old = this.clients.get(ep.id);
       const oldHandler = this.adHandlers.get(ep.id);
@@ -221,7 +232,7 @@ export class EsphomeProxyPool {
       this.adHandlers.delete(ep.id);
       if (!this.started) return;
 
-      const client = await createEsphomeClient({
+      client = await createEsphomeClient({
         host: ep.host,
         port: ep.port,
         encryption_key: ep.encryption_key,
@@ -230,7 +241,7 @@ export class EsphomeProxyPool {
         additional_proxies: [],
         advertisement_timeout: 0,
       } as EsphomeProxyConfig);
-      const handler = (ad: EsphomeBleAdvertisement): void => this.onAd(ep.id, ad);
+      handler = (ad: EsphomeBleAdvertisement): void => this.onAd(ep.id, ad);
       client.on('ble', handler);
       await waitForConnected(client, ep.id);
       if (!this.started) {
@@ -254,6 +265,18 @@ export class EsphomeProxyPool {
       }
       bleLog.info(`ESPHome proxy ${ep.id} rebuilt after advertisement silence`);
     } catch (err) {
+      // Tear the half-built replacement down before anything else, so it cannot
+      // revive behind our back and masquerade as a healthy endpoint.
+      if (client) {
+        if (handler) {
+          try {
+            client.removeListener('ble', handler as (...args: unknown[]) => void);
+          } catch {
+            /* ignore */
+          }
+        }
+        await safeDisconnect(client);
+      }
       this.rebuildAttempts.set(ep.id, (this.rebuildAttempts.get(ep.id) ?? 0) + 1);
       bleLog.warn(
         `ESPHome proxy ${ep.id} rebuild failed: ${errMsg(err)}. Will retry with backoff.`,

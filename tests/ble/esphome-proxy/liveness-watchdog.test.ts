@@ -142,3 +142,59 @@ describe('ESPHome advertisement liveness watchdog (#303)', () => {
     expect(createEsphomeClient).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('a failed rebuild must not leave an orphan client (#303)', () => {
+  beforeEach(() => {
+    created = [];
+    createEsphomeClient.mockClear();
+    safeDisconnect.mockClear();
+    waitForConnected.mockReset();
+    waitForConnected.mockImplementation(async () => {});
+    vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+    vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    waitForConnected.mockImplementation(async () => {});
+  });
+
+  it('disconnects the half-built client and detaches its listener', async () => {
+    const pool = new EsphomeProxyPool(cfg(180));
+    await pool.start();
+    expect(created).toHaveLength(1);
+
+    // The rebuild's connect fails, which is the normal case when the watchdog
+    // fires because the proxy is actually unreachable.
+    waitForConnected.mockRejectedValueOnce(new Error('Timed out connecting'));
+    await vi.advanceTimersByTimeAsync(200_000);
+
+    const replacement = created[1];
+    expect(replacement).toBeDefined();
+    // The replacement must have been torn down, not abandoned. Left attached it
+    // revives on its own (the library is built with reconnect:true) and starts
+    // feeding onAd for an endpoint that is no longer in this.clients.
+    expect(safeDisconnect).toHaveBeenCalledWith(replacement);
+    expect(replacement.listenerCount('ble')).toBe(0);
+  });
+
+  it('an orphan cannot masquerade as a healthy endpoint', async () => {
+    const pool = new EsphomeProxyPool(cfg(180));
+    await pool.start();
+
+    waitForConnected.mockRejectedValueOnce(new Error('Timed out connecting'));
+    await vi.advanceTimersByTimeAsync(200_000);
+    const orphan = created[1];
+    const callsAfterFirstRebuild = createEsphomeClient.mock.calls.length;
+
+    // If the orphan's listener were still attached, this advertisement would
+    // refresh lastAdAt and the watchdog would never fire again.
+    orphan.emit('ble', { address: 0x03b3ec93b87e, name: 'Hutbit', rssi: -60 });
+    await vi.advanceTimersByTimeAsync(400_000);
+
+    expect(createEsphomeClient.mock.calls.length).toBeGreaterThan(callsAfterFirstRebuild);
+    await pool.stop();
+  });
+});
