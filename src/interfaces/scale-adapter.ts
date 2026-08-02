@@ -267,7 +267,8 @@ export interface BroadcastSource {
  * UUID so the adapter can route by char. This is a GATT notify concern (it pairs
  * with GattWiring `characteristics` and an `onConnected` handshake), NOT a
  * passive-broadcast parser, which is why it is its own mixin and not part of
- * BroadcastSource. Declared by trisa, beurer-bf720, eufy-p2, robi-s9, ade-a2.
+ * BroadcastSource. Declared by trisa, beurer-bf720, eufy-p2, robi-s9, ade-a2,
+ * renpho, renpho-msc04 and qn-scale.
  */
 export interface MultiCharNotify {
   /**

@@ -57,8 +57,11 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    # Set BLUETOOTH_GID in a .env file next to this compose file.
+    # Find it with: getent group bluetooth | cut -d: -f3
+    # Commonly 112 on Debian/Ubuntu and 103 on Raspberry Pi OS.
     group_add:
-      - '112'
+      - '${BLUETOOTH_GID:-112}'
     volumes:
       - ./config.yaml:/app/config.yaml
       - /var/run/dbus:/var/run/dbus:ro

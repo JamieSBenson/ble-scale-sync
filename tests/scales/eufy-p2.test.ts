@@ -1,12 +1,15 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { createCipheriv, createHash } from 'node:crypto';
 import {
   EufyAuthHandler,
   EufyP2Adapter,
   buildSubContract,
+  frameIntegrityProblems,
   parseEufyAdvertisement,
   parseWeightNotification,
 } from '../../src/scales/eufy-p2.js';
+import { xorChecksum } from '../../src/scales/body-comp-helpers.js';
+import { bleLog } from '../../src/ble/types.js';
 import type { BleDeviceInfo } from '../../src/interfaces/scale-adapter.js';
 import { defaultProfile, assertPayloadRanges } from '../helpers/scale-test-utils.js';
 
@@ -25,8 +28,17 @@ function makeVendor(weightKg: number, finalFlag = 0x00): Buffer {
   return buf;
 }
 
-/** Build a 16-byte FFF2 weight notification. */
-function makeNotification(weightKg: number, impedance: number, isFinal = true): Buffer {
+/**
+ * Build a 16-byte FFF2 weight notification. `validIntegrity` fills the length
+ * byte and the trailing XOR the way real hardware does (#289); pass false to
+ * build a frame that violates both, which must still parse.
+ */
+function makeNotification(
+  weightKg: number,
+  impedance: number,
+  isFinal = true,
+  validIntegrity = true,
+): Buffer {
   const buf = Buffer.alloc(16);
   buf[0] = 0xcf;
   buf[2] = 0x00;
@@ -35,6 +47,10 @@ function makeNotification(weightKg: number, impedance: number, isFinal = true): 
   buf[9] = (impedance >> 8) & 0xff;
   buf[10] = (impedance >> 16) & 0xff;
   buf[12] = isFinal ? 0x00 : 0x01;
+  if (validIntegrity) {
+    buf[1] = 14;
+    buf[15] = xorChecksum(buf, 2, 15);
+  }
   return buf;
 }
 
@@ -331,5 +347,98 @@ describe('SegmentReassembler', () => {
     for (let i = 1; i < c1Frames.length; i++) {
       expect(h.handleC1(c1Frames[i])).toBe(false);
     }
+  });
+});
+
+/**
+ * Three real P2 Pro FFF2 frames supplied in #289, each with the body fat the
+ * Eufy app reported for the same weigh-in. They pin the frame layout and are
+ * the executable record of why the impedance decode was rejected.
+ */
+const REAL_FRAMES = [
+  {
+    bytes: [0xcf, 0x0e, 0x00, 0xcf, 0x08, 0x11, 0x56, 0x22, 0x08, 0x03, 0x88, 0, 0, 0, 0, 0x21],
+    weight: 87.9,
+    appFat: 30.1,
+  },
+  {
+    bytes: [0xcf, 0x0e, 0x00, 0xcf, 0x72, 0x10, 0x2e, 0x22, 0xee, 0xe7, 0x10, 0, 0, 0, 0, 0xb8],
+    weight: 87.5,
+    appFat: 29.5,
+  },
+  {
+    bytes: [0xcf, 0x0e, 0x00, 0xcf, 0x4a, 0x10, 0x3d, 0x22, 0x39, 0x34, 0x29, 0, 0, 0, 0, 0xae],
+    weight: 87.65,
+    appFat: 29.8,
+  },
+].map((f) => ({ ...f, buf: Buffer.from(f.bytes) }));
+
+describe('#289 real P2 Pro frames', () => {
+  it('every fixture is a 16-byte frame', () => {
+    for (const f of REAL_FRAMES) expect(f.buf.length).toBe(16);
+  });
+
+  it('decodes the app-reported weight, weight only', () => {
+    for (const f of REAL_FRAMES) {
+      expect(parseWeightNotification(f.buf)).toEqual({ weight: f.weight, impedance: 0 });
+    }
+  });
+
+  it('byte [1] is the payload length', () => {
+    for (const f of REAL_FRAMES) expect(f.buf[1]).toBe(f.buf.length - 2);
+  });
+
+  it('byte [15] is the XOR over bytes [2..14]', () => {
+    for (const f of REAL_FRAMES) expect(xorChecksum(f.buf, 2, 15)).toBe(f.buf[15]);
+  });
+
+  it('reports no integrity problems for real frames', () => {
+    for (const f of REAL_FRAMES) expect(frameIntegrityProblems(f.buf)).toEqual([]);
+  });
+
+  it('offset [4..5] does not rank with body fat, so it is not the impedance', () => {
+    const byFat = [...REAL_FRAMES].sort((a, b) => a.appFat - b.appFat);
+    const candidates = byFat.map((f) => f.buf.readUInt16LE(4));
+    expect(candidates).toEqual([4210, 4170, 4360]);
+    // A real impedance must rise with body fat. It does not: the middle two swap.
+    const monotonic = candidates.every((v, i) => i === 0 || v >= candidates[i - 1]);
+    expect(monotonic).toBe(false);
+  });
+});
+
+describe('#289 frame integrity is observed, never enforced', () => {
+  it('still parses a frame with a corrupt XOR', () => {
+    const buf = makeNotification(80, 500, true, false);
+    buf[1] = 14;
+    buf[15] = 0xff; // deliberately wrong
+    expect(frameIntegrityProblems(buf).join()).toContain('xor');
+    expect(parseWeightNotification(buf)).toEqual({ weight: 80, impedance: 0 });
+  });
+
+  it('still parses a frame with a wrong length byte', () => {
+    const buf = makeNotification(80, 500, true, false);
+    buf[15] = xorChecksum(buf, 2, 15);
+    expect(frameIntegrityProblems(buf).join()).toContain('length byte');
+    expect(parseWeightNotification(buf)).toEqual({ weight: 80, impedance: 0 });
+  });
+
+  it('ignores buffers that are not 16-byte CF frames', () => {
+    expect(frameIntegrityProblems(Buffer.alloc(8))).toEqual([]);
+    expect(frameIntegrityProblems(Buffer.alloc(16))).toEqual([]);
+  });
+
+  it('logs the mismatch once per session, not once per frame', () => {
+    const debugSpy = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+    const adapter = new EufyP2Adapter();
+    const bad = makeNotification(80, 500, true, false);
+
+    adapter.parseNotification(bad);
+    adapter.parseNotification(bad);
+
+    const hits = debugSpy.mock.calls
+      .map((c) => String(c[0]))
+      .filter((m) => m.includes('frame integrity mismatch'));
+    expect(hits).toHaveLength(1);
+    debugSpy.mockRestore();
   });
 });

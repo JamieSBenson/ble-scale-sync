@@ -148,8 +148,17 @@ function initializeAdapter(
   onNotification: (sourceUuid: string, data: Buffer) => void,
   unsubscribers: (() => void)[],
   scaleAuth?: ScaleAuth,
-): { start: () => Promise<void>; cleanup: () => void } {
+): {
+  start: () => Promise<void>;
+  cleanup: () => void;
+  /**
+   * Re-send a send-once unlock after notifications are confirmed enabled.
+   * No-op for adapters with a repeating interval or no legacy unlock.
+   */
+  resendUnlockAfterSubscribe: () => Promise<void>;
+} {
   let unlockInterval: ReturnType<typeof setInterval> | null = null;
+  let resendUnlock: (() => Promise<void>) | null = null;
 
   const cleanup = (): void => {
     if (unlockInterval) {
@@ -227,11 +236,23 @@ function initializeAdapter(
       const interval = adapter.unlockIntervalMs ?? 5000;
       if (interval > 0) {
         unlockInterval = setInterval(() => void sendUnlock(), interval);
+      } else {
+        // Send-once adapters need one repeat after notifications are actually
+        // enabled. Noble queues the CCCD write from inside its descriptor
+        // discovery callback, so this first unlock is guaranteed to reach the
+        // scale BEFORE notifications are on, and its reply would be lost. The
+        // old accidental 1 ms flood hid that; with a single write it would not
+        // be hidden. resendUnlock() below is called once the subscribe settles.
+        resendUnlock = sendUnlock;
       }
     }
   };
 
-  return { start, cleanup };
+  const resendUnlockAfterSubscribe = async (): Promise<void> => {
+    if (resendUnlock) await resendUnlock();
+  };
+
+  return { start, cleanup, resendUnlockAfterSubscribe };
 }
 
 /** Subscribe to notifications in multi-char or legacy mode, then start adapter init. */
@@ -240,6 +261,7 @@ async function subscribeAndInit(
   adapter: ScaleAdapter,
   onNotification: (sourceUuid: string, data: Buffer) => void,
   startInit: () => Promise<void>,
+  onNotifyEnabled: () => Promise<void>,
   unsubscribers: (() => void)[],
 ): Promise<void> {
   if (adapter.characteristics) {
@@ -327,6 +349,11 @@ async function subscribeAndInit(
     ]);
     unsubscribers.push(unsub);
     bleLog.info('Subscribed to notifications. Step on the scale.');
+    // The unlock above was necessarily written before notifications were on:
+    // noble queues the CCCD write from inside its descriptor discovery
+    // callback, so a send-once adapter would otherwise have its reply dropped
+    // and never retry. Repeating it here costs one write on four adapters.
+    await onNotifyEnabled();
   }
 }
 
@@ -491,7 +518,14 @@ export function waitForRawReading(
 
     // Subscribe to notifications and start adapter init.
     // Errors are caught and forwarded to the Promise's reject.
-    subscribeAndInit(charMap, adapter, handleNotification, init.start, unsubscribers).catch((e) => {
+    subscribeAndInit(
+      charMap,
+      adapter,
+      handleNotification,
+      init.start,
+      init.resendUnlockAfterSubscribe,
+      unsubscribers,
+    ).catch((e) => {
       if (!resolved) {
         init.cleanup();
         reject(e instanceof Error ? e : new Error(String(e)));

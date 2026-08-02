@@ -34,7 +34,7 @@ Run the setup wizard to create `config.yaml`:
 docker run --rm -it \
   --network host \
   --cap-add NET_ADMIN --cap-add NET_RAW \
-  --group-add 112 \
+  --group-add "$(getent group bluetooth | cut -d: -f3)" \
   -v /var/run/dbus:/var/run/dbus:ro \
   -v ./config.yaml:/app/config.yaml \
   -v ./garmin-tokens:/app/garmin-tokens \
@@ -47,7 +47,7 @@ docker run --rm -it \
 docker run -d --restart unless-stopped \
   --network host \
   --cap-add NET_ADMIN --cap-add NET_RAW \
-  --group-add 112 \
+  --group-add "$(getent group bluetooth | cut -d: -f3)" \
   --device /dev/rfkill \
   -v /var/run/dbus:/var/run/dbus:ro \
   -v ./config.yaml:/app/config.yaml:ro \
@@ -66,7 +66,7 @@ docker compose up -d
 
 ```bash
 docker run --rm --network host --cap-add NET_ADMIN --cap-add NET_RAW \
-  --group-add 112 -v /var/run/dbus:/var/run/dbus:ro \
+  --group-add "$(getent group bluetooth | cut -d: -f3)" -v /var/run/dbus:/var/run/dbus:ro \
   ghcr.io/kristianp26/ble-scale-sync:latest scan      # Discover BLE devices
 
 docker run --rm -v ./config.yaml:/app/config.yaml:ro \
@@ -89,7 +89,7 @@ sudo chown -R $(id -u):$(id -g) ./garmin-tokens
 | `-v /var/run/dbus:/var/run/dbus:ro` | Access to the system D-Bus socket |
 | `--cap-add NET_ADMIN --cap-add NET_RAW` | BLE operations require raw network access |
 | `--device /dev/rfkill` | Enables RF-level adapter recovery when BlueZ gets stuck (recommended) |
-| `--group-add <GID>` | Bluetooth group GID. Run `getent group bluetooth \| cut -d: -f3` (commonly `112`) |
+| `--group-add "$(getent group bluetooth \| cut -d: -f3)"` | Bluetooth group GID, resolved on your host. Commonly `112` on Debian/Ubuntu and `103` on Raspberry Pi OS. Keep the quotes: if the group does not exist, docker reports it instead of failing later with an unclear D-Bus error |
 :::
 
 ## Home Assistant Add-on {#home-assistant-addon}

@@ -23,7 +23,22 @@ import {
   DISCOVERY_POLL_MS,
   GATT_DISCOVERY_TIMEOUT_MS,
   IMPEDANCE_GRACE_MS,
+  RAW_READING_TIMEOUT_MS,
 } from './types.js';
+
+/**
+ * Upper bound on enabling notifications (#283).
+ *
+ * @abandonware/noble promisifies subscribe over a single `once('notify')` with
+ * no error path, and its WinRT binding has several branches that emit nothing
+ * at all: the device-not-connected guard, a failed characteristic lookup, and a
+ * CCCD write that comes back as anything other than AsyncStatus::Completed
+ * (the reporter's log shows `BLEManager::OnNotify: status: 3`). On those paths
+ * subscribeAsync never settles, so the whole reading hangs on a promise that
+ * can only be ended by the scale dropping the link, and the user sees a
+ * misleading "disconnected before reading completed".
+ */
+const NOTIFY_ENABLE_TIMEOUT_MS = 10_000;
 
 /**
  * Minimal structural surface of a Noble instance that the shared handler calls.
@@ -81,8 +96,22 @@ function wrapChar(char: Characteristic): BleChar {
   return {
     subscribe: async (onData) => {
       const listener = (data: Buffer) => onData(data);
+      // Attach before the CCCD write so a scale that notifies the instant
+      // notifications are enabled cannot beat the listener.
       char.on('data', listener);
-      await char.subscribeAsync();
+      const startedAt = Date.now();
+      try {
+        await withTimeout(
+          char.subscribeAsync(),
+          NOTIFY_ENABLE_TIMEOUT_MS,
+          `Enabling notifications on ${char.uuid} did not complete within ${NOTIFY_ENABLE_TIMEOUT_MS}ms (the CCCD write was never acknowledged)`,
+        );
+      } catch (e: unknown) {
+        // Leaving the listener attached would leak one per failed cycle.
+        char.removeListener('data', listener);
+        throw e;
+      }
+      bleLog.debug(`Notifications enabled on ${char.uuid} in ${Date.now() - startedAt}ms`);
       return () => {
         char.removeListener('data', listener);
       };
@@ -565,15 +594,22 @@ export function createNobleHandler({ noble, getState }: NobleHandlerDeps) {
         bleLog.info(`Matched adapter: ${matchedAdapter.name}`);
 
         const charMap = wrapCharacteristics(services);
-        const raw = await waitForRawReading(
-          charMap,
-          wrapPeripheral(peripheral),
-          matchedAdapter,
-          profile,
-          peripheralAddress(peripheral).replace(/[:-]/g, '').toUpperCase(),
-          weightUnit,
-          onLiveData,
-          scaleAuth,
+        // Bounded like the node-ble path (handler-node-ble/scan.ts): without
+        // this the reading phase relies entirely on the peripheral eventually
+        // disconnecting, so a stalled GATT session wedges the process (#283).
+        const raw = await withTimeout(
+          waitForRawReading(
+            charMap,
+            wrapPeripheral(peripheral),
+            matchedAdapter,
+            profile,
+            peripheralAddress(peripheral).replace(/[:-]/g, '').toUpperCase(),
+            weightUnit,
+            onLiveData,
+            scaleAuth,
+          ),
+          RAW_READING_TIMEOUT_MS,
+          'Timed out waiting for a complete scale reading',
         );
 
         return raw;
@@ -646,7 +682,7 @@ export function createNobleHandler({ noble, getState }: NobleHandlerDeps) {
     scanAndReadRaw,
     scanAndRead,
     scanDevices,
-    /** Test-only export of the private broadcast-scan helper (#163). */
-    _internals: { broadcastScan },
+    /** Test-only export of private helpers (#163, #283). */
+    _internals: { broadcastScan, wrapChar },
   };
 }

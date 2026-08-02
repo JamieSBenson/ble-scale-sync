@@ -28,6 +28,20 @@ export const EsphomeProxySchema = z
     // (the default) preserves the original single-proxy behavior. GATT
     // connects route to the proxy that last saw the scale (#116).
     additional_proxies: z.array(EsphomeEndpointSchema).default([]),
+    /**
+     * Seconds without a single BLE advertisement from a proxy before its client
+     * is torn down and rebuilt. 0 (the default) disables the watchdog entirely.
+     *
+     * Off by default on purpose. A home proxy normally sees some BLE traffic
+     * constantly, so a long silence means the transport died (#303: a single
+     * ECONNRESET produced 4h35m of nothing while the proxy itself stayed
+     * healthy). But a rebuild is a real teardown, and there is a documented
+     * setup where it would fire forever without helping: a proxy already
+     * adopted by Home Assistant only serves one advertisement subscription, so
+     * the rebuild succeeds and advertisements still never arrive. Opt in with
+     * 180 to 600 once you have seen the silence in your own log.
+     */
+    advertisement_timeout: z.number().int().min(0).max(86400).default(0),
   })
   .refine((c) => !(c.encryption_key && c.password), {
     message: 'Set either encryption_key (Noise) or password (legacy), not both',

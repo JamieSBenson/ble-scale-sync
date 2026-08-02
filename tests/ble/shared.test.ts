@@ -1361,7 +1361,47 @@ describe('waitForReading() — adapter with no unlock wiring (#244)', () => {
     expect(writeChar.writtenData.length).toBe(0);
   });
 
-  it('sends the unlock exactly once when unlockIntervalMs is 0', async () => {
+  it('re-sends a send-once unlock after notifications are enabled (#283)', async () => {
+    // Noble queues the CCCD write from inside its descriptor discovery
+    // callback, so the first unlock always reaches the scale before
+    // notifications are on. Before this repeat, removing the accidental 1 ms
+    // flood left send-once adapters with a single pre-CCCD write and no retry.
+    const notifyChar = createMockChar();
+    const writeChar = createMockChar();
+    const device = createMockDevice();
+    const { charMap } = createCharMap([
+      [NOTIFY_UUID, notifyChar],
+      [WRITE_UUID, writeChar],
+    ]);
+
+    let releaseSubscribe: (() => void) | undefined;
+    const originalSubscribe = notifyChar.subscribe.bind(notifyChar);
+    notifyChar.subscribe = async (onData: (d: Buffer) => void): Promise<() => void> => {
+      await new Promise<void>((resolve) => {
+        releaseSubscribe = resolve;
+      });
+      return originalSubscribe(onData);
+    };
+
+    const adapter = createLegacyAdapter({
+      unlockCommand: [0xa5, 0x01],
+      unlockIntervalMs: 0,
+      parseNotification: (data: Buffer) =>
+        data[0] === 0x10 ? { weight: 75.5, impedance: 500 } : null,
+    });
+
+    const promise = waitForReading(charMap, device, adapter, PROFILE, '');
+    // The unlock goes out while the subscribe is still pending, exactly as it
+    // does on a real noble connection.
+    await vi.waitFor(() => expect(writeChar.writtenData.length).toBe(1));
+    releaseSubscribe?.();
+    await vi.waitFor(() => expect(writeChar.writtenData.length).toBe(2));
+
+    notifyChar.triggerData(Buffer.from([0x10]));
+    await expect(promise).resolves.toEqual(SAMPLE_BODY_COMP);
+  });
+
+  it('sends the unlock exactly once before and once after subscribe when interval is 0', async () => {
     // `?? 5000` does not catch 0, so this used to arm setInterval(fn, 0), which
     // clamps to about 1 ms on Linux and floods the link for the whole session.
     // Four adapters declare 0 (Active Era, ES-CS20M, Hesley, 1byone new).
@@ -1381,9 +1421,11 @@ describe('waitForReading() — adapter with no unlock wiring (#244)', () => {
     });
 
     const promise = waitForReading(charMap, device, adapter, PROFILE, '');
-    await vi.waitFor(() => expect(writeChar.writtenData.length).toBe(1));
+    // One before the subscribe resolves, one repeat after. No interval timer,
+    // so the count must then stay put.
+    await vi.waitFor(() => expect(writeChar.writtenData.length).toBe(2));
     await new Promise((r) => setTimeout(r, 60));
-    expect(writeChar.writtenData.length).toBe(1);
+    expect(writeChar.writtenData.length).toBe(2);
 
     notifyChar.triggerData(Buffer.from([0x10]));
     await expect(promise).resolves.toEqual(SAMPLE_BODY_COMP);

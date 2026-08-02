@@ -163,7 +163,9 @@ The `--group-add` value must match your system's Bluetooth group. Find it with:
 getent group bluetooth | cut -d: -f3
 ```
 
-Common values: `112` (Debian/Ubuntu), `108` (Arch).
+Common values: `112` (Debian/Ubuntu), `103` (Raspberry Pi OS), `108` (Arch).
+
+The documented commands resolve this for you with `--group-add "$(getent group bluetooth | cut -d: -f3)"`. If that produced nothing, the host has no `bluetooth` group at all, and `docker run` will say so rather than failing later with an unclear D-Bus error.
 
 ### BLE discovery stops working after hours (BlueZ stuck state)
 

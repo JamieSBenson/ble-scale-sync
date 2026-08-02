@@ -20,7 +20,7 @@ The fastest way to configure BLE Scale Sync is with the **interactive setup wiza
 ```bash
 # Docker (Linux)
 docker run --rm -it --network host --cap-add NET_ADMIN --cap-add NET_RAW \
-  --group-add 112 -v /var/run/dbus:/var/run/dbus:ro \
+  --group-add "$(getent group bluetooth | cut -d: -f3)" -v /var/run/dbus:/var/run/dbus:ro \
   -v ./config.yaml:/app/config.yaml ghcr.io/kristianp26/ble-scale-sync:latest setup
 
 # Standalone (Node.js, Linux/macOS/Windows)

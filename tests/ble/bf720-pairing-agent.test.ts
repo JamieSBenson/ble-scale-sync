@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   BlueZPairingAgent,
   registerPairingAgent,
+  ensurePairingAgent,
+  setPairingTarget,
   forgetPairingAgent,
   AGENT_PATH,
   AGENT_CAPABILITY,
@@ -10,6 +12,7 @@ import { bleLog } from '../../src/ble/types.js';
 
 beforeEach(() => {
   forgetPairingAgent();
+  setPairingTarget(() => ({}));
   vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
   vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
   vi.spyOn(bleLog, 'info').mockImplementation(() => {});
@@ -133,5 +136,78 @@ describe('registerPairingAgent', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect(registerPairingAgent(bus as any, () => 1)).resolves.toBeUndefined();
     expect(bus.unexport).toHaveBeenCalledWith(AGENT_PATH, expect.anything());
+  });
+});
+
+describe('ensurePairingAgent (#83)', () => {
+  it('registers on a fresh bus regardless of bond state', async () => {
+    const { bus, mgr } = fakeBus();
+    setPairingTarget(() => ({ pin: 1894, mac: 'D8:0B:CB:5B:B6:58' }));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ensurePairingAgent(bus as any);
+    expect(bus.export).toHaveBeenCalledWith(AGENT_PATH, expect.anything());
+    expect(mgr.RegisterAgent).toHaveBeenCalledWith(AGENT_PATH, AGENT_CAPABILITY);
+  });
+
+  it('claims the default-agent role only when a PIN is configured', async () => {
+    const withPin = fakeBus();
+    setPairingTarget(() => ({ pin: 1894 }));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ensurePairingAgent(withPin.bus as any);
+    expect(withPin.mgr.RequestDefaultAgent).toHaveBeenCalled();
+
+    forgetPairingAgent();
+
+    const noPin = fakeBus();
+    setPairingTarget(() => ({}));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ensurePairingAgent(noPin.bus as any);
+    expect(noPin.mgr.RegisterAgent).toHaveBeenCalled();
+    // Never take the system-wide role we cannot honour without a PIN.
+    expect(noPin.mgr.RequestDefaultAgent).not.toHaveBeenCalled();
+  });
+
+  it('claims the default-agent role later if a PIN appears after a reload', async () => {
+    const { bus, mgr } = fakeBus();
+    setPairingTarget(() => ({}));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ensurePairingAgent(bus as any);
+    expect(mgr.RequestDefaultAgent).not.toHaveBeenCalled();
+
+    setPairingTarget(() => ({ pin: 2520 }));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ensurePairingAgent(bus as any);
+    expect(mgr.RequestDefaultAgent).toHaveBeenCalledTimes(1);
+    expect(bus.export).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('pairing agent MAC scoping (#83)', () => {
+  const TARGET = '/org/bluez/hci0/dev_D8_0B_CB_5B_B6_58';
+  const OTHER = '/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF';
+
+  function agentFor(mac?: string) {
+    const agent = new BlueZPairingAgent();
+    agent.setTargetProvider(() => ({ pin: 1894, mac }));
+    return agent;
+  }
+
+  it('serves the configured scale', () => {
+    const agent = agentFor('D8:0B:CB:5B:B6:58');
+    expect(agent.RequestPasskey(TARGET)).toBe(1894);
+    expect(() => agent.RequestConfirmation(TARGET, 123456)).not.toThrow();
+  });
+
+  it('declines an unrelated device so it cannot use the scale PIN', () => {
+    const agent = agentFor('D8:0B:CB:5B:B6:58');
+    expect(() => agent.RequestPasskey(OTHER)).toThrow();
+    expect(() => agent.RequestConfirmation(OTHER, 123456)).toThrow();
+    expect(() => agent.AuthorizeService(OTHER, '0000180a-0000-1000-8000-00805f9b34fb')).toThrow();
+  });
+
+  it('serves any device when no scale_mac is configured (auto-discovery)', () => {
+    const agent = agentFor(undefined);
+    expect(agent.RequestPasskey(OTHER)).toBe(1894);
+    expect(() => agent.RequestConfirmation(OTHER, 1)).not.toThrow();
   });
 });

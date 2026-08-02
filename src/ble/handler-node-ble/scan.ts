@@ -29,13 +29,14 @@ import { helperOf, getDbusNext, type Adapter, type Device } from './dbus.js';
 import {
   getAdapter,
   getBus,
+  attachBusErrorHandler,
   resetConnection,
   isStaleConnectionError,
   isDbusConnectionError,
   dbusError,
   parseHciIndex,
 } from './connection.js';
-import { registerPairingAgent } from './agent.js';
+import { registerPairingAgent, setPairingTarget } from './agent.js';
 import {
   startDiscoverySafe,
   removeDevice,
@@ -173,6 +174,12 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
   // Latest resolved adapter handle, captured for the failure-classification
   // liveness probe (#213). Stays undefined if getAdapter never succeeds.
   let probeAdapter: Adapter | undefined;
+
+  // Publish this cycle's pairing target before the first getAdapter(), which is
+  // where the agent registers. Stored as a closure rather than a value so a
+  // config reload lands on the next cycle without a restart, and MAC-scoped so
+  // an unrelated peer cannot be handed the scale's consent PIN (#83).
+  setPairingTarget(() => ({ pin: scaleAuth?.pin, mac: targetMac }));
 
   try {
     try {
@@ -527,6 +534,13 @@ export async function scanDevices(
     if (isDbusConnectionError(err)) throw dbusError();
     throw err;
   }
+
+  // This session owns its own bus, so it needs its own error listener or a
+  // socket failure here is an uncaught exception (#290). No latch: the function
+  // is one-shot and its finally block tears the session down.
+  attachBusErrorHandler(bluetooth, (err) =>
+    bleLog.warn(`D-Bus transport error during scan: ${errMsg(err)}`),
+  );
 
   let btAdapter: Adapter | null = null;
 

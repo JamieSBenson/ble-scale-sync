@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { QnScaleAdapter } from '../../src/scales/qn-scale.js';
+import { bleLog } from '../../src/ble/types.js';
 import type { BleDeviceInfo, ConnectionContext } from '../../src/interfaces/scale-adapter.js';
 import {
   mockPeripheral,
@@ -262,6 +263,22 @@ describe('QnScaleAdapter', () => {
     it('returns null for too-short buffer', () => {
       const adapter = makeAdapter();
       expect(adapter.parseNotification(Buffer.alloc(2))).toBeNull();
+    });
+
+    it('logs the discarded frame so an AE00 challenge is visible in a debug log (#75)', () => {
+      const adapter = makeAdapter();
+      const debugSpy = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      // A real 17-byte AE02 challenge from the Arboleaf capture in #75. It has
+      // no 0x10 opcode, so it is discarded, but it must not vanish silently.
+      const buf = Buffer.from('00664d6b485e50d84a9eb9405f9ef787f3', 'hex');
+
+      expect(adapter.parseNotification(buf)).toBeNull();
+
+      const logged = debugSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(logged).toContain('opcode=0x00');
+      expect(logged).toContain('len=17');
+      expect(logged).toContain('664d6b485e50d84a9eb9405f9ef787f3');
+      debugSpy.mockRestore();
     });
 
     it('returns null for 0x10 frame shorter than 10 bytes', () => {
@@ -942,5 +959,62 @@ describe('QnScaleAdapter', () => {
       expect(reading!.weight).toBe(60);
       expect(reading!.impedance).toBe(509);
     });
+  });
+});
+
+describe('AE02 dispatch (#75, #235)', () => {
+  const AE02 = '0000ae0200001000800000805f9b34fb';
+  // Real AE00 challenge from the Arboleaf capture in #75.
+  const challenge = Buffer.from('00664d6b485e50d84a9eb9405f9ef787f3', 'hex');
+
+  it('swallows the AE00 challenge instead of parsing it as a vendor frame', () => {
+    const adapter = makeAdapter();
+    const debugSpy = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+
+    expect(adapter.parseCharNotification(AE02, challenge)).toBeNull();
+
+    const logged = debugSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).toContain('QN AE02 (17B)');
+    expect(logged).toContain('AE00 challenge frame received');
+    debugSpy.mockRestore();
+  });
+
+  it('reports the challenge once per session', () => {
+    const adapter = makeAdapter();
+    const debugSpy = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+
+    adapter.parseCharNotification(AE02, challenge);
+    adapter.parseCharNotification(AE02, challenge);
+
+    const hits = debugSpy.mock.calls
+      .map((c) => String(c[0]))
+      .filter((m) => m.includes('AE00 challenge frame received'));
+    expect(hits).toHaveLength(1);
+    debugSpy.mockRestore();
+  });
+
+  it('still parses a real weight frame arriving on the notify characteristic', () => {
+    const adapter = makeAdapter();
+    const buf = Buffer.alloc(10);
+    buf[0] = 0x10;
+    buf[1] = 0x0a;
+    buf[2] = 0x01;
+    buf.writeUInt16BE(8000, 3);
+    buf[5] = 1; // stable
+    buf.writeUInt16BE(500, 6);
+    buf.writeUInt16BE(500, 8);
+
+    const reading = adapter.parseCharNotification('0000fff100001000800000805f9b34fb', buf);
+    expect(reading?.weight).toBeGreaterThan(0);
+  });
+
+  it('does not swallow a non-challenge frame seen on AE02', () => {
+    const adapter = makeAdapter();
+    vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+    // 17 bytes but not the 0x00 header: must fall through to the normal parser.
+    const notChallenge = Buffer.from('10664d6b485e50d84a9eb9405f9ef787f3', 'hex');
+    // Falls through and is rejected by the vendor parser, not by the AE02 gate.
+    expect(adapter.parseCharNotification(AE02, notChallenge)).toBeNull();
+    vi.restoreAllMocks();
   });
 });

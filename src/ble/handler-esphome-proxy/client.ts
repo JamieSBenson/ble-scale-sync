@@ -120,7 +120,8 @@ export interface EsphomeBleAdvertisement {
 export interface EsphomeClient {
   connect(): void;
   disconnect(): void;
-  on(event: 'connected' | 'disconnected' | 'reconnect', listener: () => void): EsphomeClient;
+  // 'reconnect' is emitted by the Connection, never by the Client.
+  on(event: 'connected' | 'disconnected' | 'initialized', listener: () => void): EsphomeClient;
   on(event: 'ble', listener: (msg: EsphomeBleAdvertisement) => void): EsphomeClient;
   on(event: 'error', listener: (err: unknown) => void): EsphomeClient;
   removeListener(event: string, listener: (...args: unknown[]) => void): EsphomeClient;
@@ -153,6 +154,11 @@ export interface EsphomeConnection {
     handle: number,
     value: Uint8Array,
   ): Promise<unknown>;
+  /**
+   * Optional so existing test doubles with a bare `connection: {}` still
+   * type-check. Used by safeDisconnect to guarantee teardown.
+   */
+  disconnect?(): void;
 }
 
 // ─── Client factory ──────────────────────────────────────────────────────────
@@ -195,6 +201,25 @@ export async function createEsphomeClient(config: EsphomeProxyConfig): Promise<E
   client.on('error', (err) => {
     bleLog.warn(`ESPHome proxy ${config.host}:${config.port} error: ${errMsg(err)}`);
   });
+
+  // Lifecycle logging (#303). Without it a dead transport and a quiet house are
+  // indistinguishable in the log: a reporter lost 4h35m of readings after a
+  // single ECONNRESET with no further output of any kind, and could not tell
+  // whether the client had reconnected, whether the advertisement subscription
+  // had come back, or whether anything had happened at all.
+  const ep = `${config.host}:${config.port}`;
+  client.on('connected', () => bleLog.info(`ESPHome proxy ${ep} connected`));
+  client.on('disconnected', () => bleLog.info(`ESPHome proxy ${ep} disconnected`));
+  // Emitted only after subscribeBluetoothAdvertisementService() resolves, so it
+  // is the positive confirmation that BLE advertisements are actually flowing.
+  client.on('initialized', () =>
+    bleLog.info(`ESPHome proxy ${ep} initialized, BLE advertisement subscription active`),
+  );
+  // 'reconnect' lives on the Connection, not the Client. Optional-chained
+  // because test doubles and older library builds may not expose `connection`.
+  client.connection?.on?.('reconnect', () =>
+    bleLog.info(`ESPHome proxy ${ep} scheduling reconnect (library retries every 30s)`),
+  );
 
   return client;
 }
@@ -251,5 +276,18 @@ export async function safeDisconnect(client: EsphomeClient): Promise<void> {
     client.disconnect();
   } catch {
     /* ignore */
+  } finally {
+    // Client.disconnect() calls unsubscribeBluetoothAdvertisementService()
+    // first, which throws "Not authorized" in the window where the socket is
+    // connected but the hello/auth round trip has not finished. That throw
+    // happens BEFORE connection.disconnect(), so the old Connection keeps
+    // reconnect:true, keeps its ping and reconnect timers running, and keeps
+    // holding the node's single advertisement-subscription slot. Swallowing it
+    // silently was enough to leak a client per teardown (#303).
+    try {
+      client.connection?.disconnect?.();
+    } catch {
+      /* ignore */
+    }
   }
 }

@@ -39,12 +39,26 @@ import type { MatchDescriptor } from './match-descriptor.js';
  *   4. scale  -> client on FFF4:  C3 01 00 01 <status> <XOR>
  *      status == 0 means auth successful. From then on FFF2 yields weight frames.
  *
- * Weight frame (FFF2, 16 bytes):
- *   [0]    0xCF signature
- *   [2]    0x00
- *   [6..7] weight LE  / 100 = kg
- *   [8..10] NOT a usable resistance; upstream keeps this decode disabled (#289)
- *   [12]   0x00 when final (stable) reading
+ * Weight frame (FFF2, exactly 16 bytes). Layout verified byte for byte against
+ * three real P2 Pro frames with app-reported ground truth (#289):
+ *   [0]      0xCF signature
+ *   [1]      0x0E payload length, i.e. the bytes after the 2-byte header
+ *   [2]      0x00
+ *   [3]      0xCF frame type
+ *   [4..5]   varies per measurement, NOT impedance (see below)
+ *   [6..7]   weight LE / 100 = kg
+ *   [8..10]  high entropy, no measurement meaning found
+ *   [12]     0x00 when final (stable) reading
+ *   [15]     XOR of bytes [2..14]
+ *
+ * Impedance is not decodable from this frame on the evidence available, and
+ * offset [4..5] is actively disfavoured as a candidate. Across the three #289
+ * samples (87.90 kg / 30.1 %, 87.50 kg / 29.5 %, 87.65 kg / 29.8 %) it reads
+ * 4360, 4210, 4170 LE, which ranks in the wrong order against the reported body
+ * fat, varies about five times more than the observed body fat spread allows,
+ * and fits worse than assuming impedance is constant. Both the GATT and the
+ * broadcast path stay weight-only and let the shared Deurenberg fallback
+ * estimate composition.
  *
  * Advertisement frame (19 bytes of vendor data, company ID 0xFF48):
  *   [0..5] scale MAC
@@ -258,6 +272,34 @@ export class EufyAuthHandler {
   }
 }
 
+/**
+ * Observed FFF2 invariants, reported and never enforced.
+ *
+ * All three real P2 Pro frames in #289 satisfy both:
+ *   data[1] === data.length - 2             (0x0E payload length)
+ *   data[15] === xorChecksum(data, 2, 15)   (XOR over bytes 2..14)
+ *
+ * Returns the list of violations, empty when the frame is clean or is not a
+ * 16-byte 0xCF frame at all. Callers only log. Three frames from one unit on
+ * one firmware, with nothing from a T9148, is not enough evidence to gate a
+ * widely deployed adapter: a wrong gate would silently drop every reading on
+ * all three transports. Promote to a hard reject once frames from a second
+ * unit confirm both invariants.
+ */
+export function frameIntegrityProblems(data: Buffer): string[] {
+  if (data.length !== 16 || data[0] !== 0xcf || data[2] !== 0x00) return [];
+  const problems: string[] = [];
+  const expectedLen = data.length - 2;
+  if (data[1] !== expectedLen) {
+    problems.push(`length byte 0x${data[1].toString(16)} != ${expectedLen}`);
+  }
+  const expectedXor = xorChecksum(data, 2, 15);
+  if (data[15] !== expectedXor) {
+    problems.push(`xor 0x${data[15].toString(16)} != expected 0x${expectedXor.toString(16)}`);
+  }
+  return problems;
+}
+
 /** Parse a 16-byte weight notification frame from FFF2. Returns null if malformed. */
 export function parseWeightNotification(data: Buffer): ScaleReading | null {
   if (data.length !== 16 || data[0] !== 0xcf || data[2] !== 0x00) return null;
@@ -320,6 +362,9 @@ export class EufyP2Adapter
   /** True once two consecutive final GATT frames reported the same weight. */
   private weightStable = false;
 
+  /** Whether an FFF2 frame-integrity mismatch has already been reported this session. */
+  private frameIntegrityLogged = false;
+
   matches(device: BleDeviceInfo): boolean {
     const name = (device.localName || '').toLowerCase();
     if (name.startsWith('eufy t9148') || name.startsWith('eufy t9149')) return true;
@@ -344,6 +389,7 @@ export class EufyP2Adapter
     this.c3Seen.done = false;
     this.previousFinalRawWeight = null;
     this.weightStable = false;
+    this.frameIntegrityLogged = false;
     if (!ctx.deviceAddress) {
       bleLog.warn('Eufy: no device address available — auth will fail without MAC');
       return;
@@ -368,6 +414,7 @@ export class EufyP2Adapter
         bleLog.debug('Eufy: FFF2 frame received before auth complete — ignoring');
         return null;
       }
+      this.noteFrameIntegrity(data);
       return this.trackStability(parseWeightNotification(data));
     }
     return null;
@@ -375,7 +422,25 @@ export class EufyP2Adapter
 
   /** Fallback single-char path (not used when parseCharNotification is defined). */
   parseNotification(data: Buffer): ScaleReading | null {
+    this.noteFrameIntegrity(data);
     return this.trackStability(parseWeightNotification(data));
+  }
+
+  /**
+   * Report an FFF2 frame that violates a #289 invariant, at most once per
+   * session. Diagnostic only: the frame is parsed exactly as before either way.
+   * Once per session rather than once per frame, because this runs for every
+   * streaming frame and an unconditional line would flood exactly the log you
+   * want to read.
+   */
+  private noteFrameIntegrity(data: Buffer): void {
+    if (this.frameIntegrityLogged) return;
+    const problems = frameIntegrityProblems(data);
+    if (problems.length === 0) return;
+    this.frameIntegrityLogged = true;
+    bleLog.debug(
+      `Eufy: FFF2 frame integrity mismatch (${problems.join('; ')}), parsed anyway (#289)`,
+    );
   }
 
   /**
