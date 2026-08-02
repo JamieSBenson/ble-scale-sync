@@ -11,6 +11,11 @@ import {
 import type { Adapter, Device } from './dbus.js';
 import { startDiscoverySafe, removeDevice, stopDiscoveryAndQuiesce } from './discovery.js';
 import { startPeerFreshnessTracker } from './freshness.js';
+import {
+  isAuthClassConnectFailure,
+  staleBondMessage,
+  STALE_BOND_EVIDENCE_ATTEMPTS,
+} from './stale-bond.js';
 import { isDeviceObjectGone } from './device-object.js';
 
 export interface ConnectRecoveryContext {
@@ -47,6 +52,8 @@ export async function connectWithRecovery(ctx: ConnectRecoveryContext): Promise<
   // by default, so every other node-ble user takes the identical code path.
   let keepDiscovery = ctx.keepDiscoveryDuringConnect === true;
   let sawObjectGone = false;
+  // Consecutive authentication-class failures, reset by any other error (#290).
+  let authClassFailures = 0;
   // Long-lived PropertiesChanged subscription on the current device proxy so
   // every received advertisement updates the freshness clock. The tracker is
   // rebound when the catch branch swaps the device reference.
@@ -106,6 +113,7 @@ export async function connectWithRecovery(ctx: ConnectRecoveryContext): Promise<
         return device;
       } catch (err: unknown) {
         const msg = errMsg(err);
+        authClassFailures = isAuthClassConnectFailure(err) ? authClassFailures + 1 : 0;
         if (isDeviceObjectGone(err)) sawObjectGone = true;
         if (sawObjectGone && !keepDiscovery) {
           keepDiscovery = true;
@@ -121,6 +129,24 @@ export async function connectWithRecovery(ctx: ConnectRecoveryContext): Promise<
             throw new Error(
               `Connection failed after ${maxRetries + 1} attempts: BlueZ keeps removing the D-Bus object for ${formattedMac}, so no GATT connection can be opened. The scale advertises but does not accept connections (broadcast only or non-discoverable). Last error: ${msg}`,
             );
+          }
+          // A run of authentication-class aborts against a peer BlueZ still
+          // lists as bonded is the #290 signature: the scale rejected the
+          // stored key. Say so, with the remedy, instead of surfacing the bare
+          // BlueZ string that told nobody anything. Diagnosis only, since the
+          // same string also has benign producers (a connect issued while
+          // discovery is still active, or another D-Bus client holding a
+          // discovery session), so we never delete the bond on our own.
+          if (authClassFailures >= STALE_BOND_EVIDENCE_ATTEMPTS) {
+            let bonded = false;
+            try {
+              bonded = ((await device?.isPaired()) as unknown as boolean) === true;
+            } catch {
+              bonded = false;
+            }
+            if (bonded) {
+              throw new Error(staleBondMessage(formattedMac, maxRetries + 1, msg));
+            }
           }
           throw new Error(`Connection failed after ${maxRetries + 1} attempts: ${msg}`);
         }
