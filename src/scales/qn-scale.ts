@@ -532,8 +532,19 @@ export class QnScaleAdapter implements ScaleAdapterCore, GattWiring, BroadcastSo
       return { weight, impedance: r1 > 0 ? r1 : r2 };
     }
 
-    // 0x10: live weight frame
-    if (opcode !== 0x10 || data.length < 10) return null;
+    // 0x10: live weight frame.
+    // Anything else lands here and used to be discarded in silence, which is why
+    // #75 read as a decode bug: the AE00 challenge frames the scale sends on AE02
+    // reach this parser (we declare no parseCharNotification, so shared.ts feeds
+    // every characteristic through the same UUID-blind path) and vanished without
+    // a trace. Log the frame so the next reporter log carries the evidence.
+    if (opcode !== 0x10 || data.length < 10) {
+      bleLog.debug(
+        `QN: ignoring frame opcode=0x${opcode.toString(16).padStart(2, '0')} ` +
+          `len=${data.length} hex=${Buffer.from(data).toString('hex')}`,
+      );
+      return null;
+    }
 
     let stable: boolean;
     let rawWeight: number;

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { QnScaleAdapter } from '../../src/scales/qn-scale.js';
+import { bleLog } from '../../src/ble/types.js';
 import type { BleDeviceInfo, ConnectionContext } from '../../src/interfaces/scale-adapter.js';
 import {
   mockPeripheral,
@@ -262,6 +263,22 @@ describe('QnScaleAdapter', () => {
     it('returns null for too-short buffer', () => {
       const adapter = makeAdapter();
       expect(adapter.parseNotification(Buffer.alloc(2))).toBeNull();
+    });
+
+    it('logs the discarded frame so an AE00 challenge is visible in a debug log (#75)', () => {
+      const adapter = makeAdapter();
+      const debugSpy = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      // A real 17-byte AE02 challenge from the Arboleaf capture in #75. It has
+      // no 0x10 opcode, so it is discarded, but it must not vanish silently.
+      const buf = Buffer.from('00664d6b485e50d84a9eb9405f9ef787f3', 'hex');
+
+      expect(adapter.parseNotification(buf)).toBeNull();
+
+      const logged = debugSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(logged).toContain('opcode=0x00');
+      expect(logged).toContain('len=17');
+      expect(logged).toContain('664d6b485e50d84a9eb9405f9ef787f3');
+      debugSpy.mockRestore();
     });
 
     it('returns null for 0x10 frame shorter than 10 bytes', () => {
