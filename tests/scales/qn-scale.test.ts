@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { jieliAuthResponseFrame } from '../../src/scales/jieli-auth.js';
 import { QnScaleAdapter } from '../../src/scales/qn-scale.js';
 import { bleLog } from '../../src/ble/types.js';
 import type { BleDeviceInfo, ConnectionContext } from '../../src/interfaces/scale-adapter.js';
@@ -964,8 +965,35 @@ describe('QnScaleAdapter', () => {
 
 describe('AE02 dispatch (#75, #235)', () => {
   const AE02 = '0000ae0200001000800000805f9b34fb';
+  const AE01 = '0000ae0100001000800000805f9b34fb';
   // Real AE00 challenge from the Arboleaf capture in #75.
   const challenge = Buffer.from('00664d6b485e50d84a9eb9405f9ef787f3', 'hex');
+
+  /** Connect an adapter and capture every AE01 write. */
+  async function connectCapturingAe01(
+    adapter: QnScaleAdapter,
+  ): Promise<{ writes: Buffer[]; flush: () => Promise<void> }> {
+    const writes: Buffer[] = [];
+    const ctx = {
+      write: async (uuid: string, data: Buffer | number[]) => {
+        if (uuid === AE01) writes.push(Buffer.from(data as number[]));
+      },
+      read: async () => Buffer.alloc(0),
+      subscribe: async () => {},
+      profile: defaultProfile,
+      deviceAddress: '',
+      availableChars: new Set<string>([AE01, AE02]),
+    } as unknown as ConnectionContext;
+    await adapter.onConnected(ctx);
+    writes.length = 0; // drop the handshake init frame; only challenge traffic matters here
+    return {
+      writes,
+      flush: async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      },
+    };
+  }
 
   it('swallows the AE00 challenge instead of parsing it as a vendor frame', () => {
     const adapter = makeAdapter();
@@ -973,9 +1001,9 @@ describe('AE02 dispatch (#75, #235)', () => {
 
     expect(adapter.parseCharNotification(AE02, challenge)).toBeNull();
 
-    const logged = debugSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    const logged = debugSpy.mock.calls.map((c) => String(c[0])).join(' | ');
     expect(logged).toContain('QN AE02 (17B)');
-    expect(logged).toContain('AE00 challenge frame received');
+    expect(logged).toContain('AE00 challenge received');
     debugSpy.mockRestore();
   });
 
@@ -988,9 +1016,45 @@ describe('AE02 dispatch (#75, #235)', () => {
 
     const hits = debugSpy.mock.calls
       .map((c) => String(c[0]))
-      .filter((m) => m.includes('AE00 challenge frame received'));
+      .filter((m) => m.includes('AE00 challenge received'));
     expect(hits).toHaveLength(1);
     debugSpy.mockRestore();
+  });
+
+  // The gate itself: without this write the scale never sends a 0x10 frame.
+  // The expected bytes are the JieLi RcspAuth response for this exact
+  // challenge, computed by src/scales/jieli-auth.ts (verified in #235 against
+  // ten captured pairs).
+  it('answers the challenge on AE01 with the JieLi response frame', async () => {
+    const adapter = makeAdapter();
+    vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+    const { writes, flush } = await connectCapturingAe01(adapter);
+
+    adapter.parseCharNotification(AE02, challenge);
+    await flush();
+
+    expect(writes).toHaveLength(1);
+    const expected = jieliAuthResponseFrame(challenge);
+    expect(writes[0].toString('hex')).toBe(expected.toString('hex'));
+    expect(writes[0][0]).toBe(0x01);
+    expect(writes[0]).toHaveLength(17);
+    vi.restoreAllMocks();
+  });
+
+  it('stops answering (and warns) when the scale keeps re-challenging', async () => {
+    const adapter = makeAdapter();
+    vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+    const { writes, flush } = await connectCapturingAe01(adapter);
+
+    for (let i = 0; i < 6; i++) {
+      adapter.parseCharNotification(AE02, challenge);
+      await flush();
+    }
+
+    expect(writes).toHaveLength(3);
+    expect(warnSpy.mock.calls.map((c) => String(c[0])).join(' | ')).toContain('re-issued the AE00');
+    vi.restoreAllMocks();
   });
 
   it('still parses a real weight frame arriving on the notify characteristic', () => {

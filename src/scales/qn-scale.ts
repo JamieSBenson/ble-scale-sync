@@ -14,6 +14,11 @@ import type {
 import { uuid16 } from './body-comp-helpers.js';
 import { bleLog, errMsg, normalizeUuid } from '../ble/types.js';
 import type { MatchDescriptor } from './match-descriptor.js';
+import {
+  jieliAuthResponseFrame,
+  JIELI_CHALLENGE_FRAME_LEN,
+  JIELI_CHALLENGE_HEADER,
+} from './jieli-auth.js';
 import type { WeightUnit } from '../config/schema.js';
 
 /** Format bytes as hex string for debug logging. */
@@ -126,6 +131,13 @@ const MAX_STORED_RECORD_AGE_SEC = 90;
 const MAX_STORED_QUERY_ATTEMPTS = 6;
 const STORED_QUERY_RETRY_MS = 3000;
 
+/**
+ * Cap on AE00 challenge responses per session. The captured vendor exchange
+ * contains exactly one scale-issued challenge; more than a couple means the
+ * scale is rejecting the response, and answering forever would be a write storm.
+ */
+const MAX_AE00_RESPONSES = 3;
+
 export class QnScaleAdapter
   implements ScaleAdapterCore, GattWiring, BroadcastSource, MultiCharNotify
 {
@@ -176,6 +188,17 @@ export class QnScaleAdapter
 
   /** Whether an AE00 challenge frame has already been reported this session. */
   private ae00ChallengeSeen = false;
+
+  /** Serialises every AE01 write within one session (see writeAe01). */
+  private ae01Chain: Promise<void> = Promise.resolve();
+
+  /**
+   * AE00 challenges answered this session. The captured vendor exchange has
+   * exactly one scale-issued challenge, so a scale that keeps challenging is
+   * rejecting our response; answering it forever would be a write storm on a
+   * link that is already failing.
+   */
+  private ae00ResponsesSent = 0;
 
   /**
    * Whether the scale sent a long-frame (18-byte) 0x12 variant (e.g. ES-26M).
@@ -245,15 +268,34 @@ export class QnScaleAdapter
     bleLog.debug(`QN write: [${hex(data)}]`);
   }
 
-  /** Write to AE01 (best-effort, not all firmware has AE00 service). */
+  /**
+   * Write to AE01 (best-effort, not all firmware has AE00 service).
+   *
+   * Serialised through a per-session chain. Three independent paths write here
+   * (the `fe dc ba c0` init from handleScaleInfo, the legacy `pass` frame from
+   * handleReady, and the challenge response below), all fire-and-forget from
+   * notification handlers, and the captured vendor session sends them strictly
+   * in order. Overlapping writes on one characteristic are a transport-level
+   * gamble with nothing to gain.
+   */
   private async writeAe01(data: number[]): Promise<void> {
     if (!this.ctx) return;
-    try {
-      await this.ctx.write(CHR_AE01, data, false);
-      bleLog.debug(`QN AE01 write: [${hex(data)}]`);
-    } catch {
-      // AE01 not available
-    }
+    // Bind the write to the context it was queued for. Links already on the
+    // chain when a session dies would otherwise re-read this.ctx at execution
+    // time and replay a dead session's frame onto the new link, which for an
+    // authentication response means handing the scale a nonce it has forgotten.
+    const owner = this.ctx;
+    const run = async (): Promise<void> => {
+      if (!this.ctx || this.ctx !== owner) return;
+      try {
+        await this.ctx.write(CHR_AE01, data, false);
+        bleLog.debug(`QN AE01 write: [${hex(data)}]`);
+      } catch {
+        // AE01 not available
+      }
+    };
+    this.ae01Chain = this.ae01Chain.then(run, run);
+    return this.ae01Chain;
   }
 
   /**
@@ -274,6 +316,8 @@ export class QnScaleAdapter
     this.hasAe00 = false;
     this.ae02Subscribe = null;
     this.ae00ChallengeSeen = false;
+    this.ae01Chain = Promise.resolve();
+    this.ae00ResponsesSent = 0;
     this.isLongFrameVariant = false;
     this.firstStableNoImpedanceAt = null;
     this.sessionStartedScaleSeconds = Math.floor(Date.now() / 1000) - SCALE_EPOCH_OFFSET;
@@ -494,17 +538,15 @@ export class QnScaleAdapter
    * Only the positively identified challenge shape is intercepted: 17 bytes
    * whose first byte is 0x00. That byte is the one position identical across all
    * three #75 samples while the remaining 16 are high entropy, so it is the AE00
-   * header rather than payload. Suppressing exactly that shape is
-   * behaviour-identical to today, because parseNotification already returns null
-   * for opcode 0x00. Anything else on AE02 still falls through to the unchanged
-   * parser, so no scale that currently gets a reading over AE02 can lose it.
-   * #75 / #235.
+   * header rather than payload. Anything else on AE02 still falls through to the
+   * unchanged parser, so no scale that currently gets a reading over AE02 can
+   * lose it. #75 / #235.
    */
   parseCharNotification(charUuid: string, data: Buffer): ScaleReading | null {
     if (normalizeUuid(charUuid) === CHR_AE02) {
       bleLog.debug(`QN AE02 (${data.length}B): [${hex(data)}]`);
       if (this.isAe00Challenge(data)) {
-        this.noteAe00Challenge();
+        this.answerAe00Challenge(data);
         return null;
       }
     }
@@ -513,29 +555,58 @@ export class QnScaleAdapter
 
   /** Signature of the AE00 challenge as captured in #75: 17 bytes, header 0x00. */
   private isAe00Challenge(data: Buffer): boolean {
-    return data.length === 17 && data[0] === 0x00;
+    return data.length === JIELI_CHALLENGE_FRAME_LEN && data[0] === JIELI_CHALLENGE_HEADER;
   }
 
   /**
-   * Record the AE00 challenge once per session. No response is sent: the #75
-   * capture contains one challenge and no observed response, which is
-   * information-theoretically insufficient to derive one, and fifteen guessable
-   * AES-128 keys were tried and rejected. Shipping a guess would be worse than
-   * shipping nothing.
+   * Answer an AE00 challenge on AE01.
    *
-   * Logged at debug rather than warn on purpose: the AE00 service is also
-   * present on Renpho ES-CS20M firmware that reads fine, so a warning on every
-   * successful session would be a regression.
+   * The gate is JieLi's RcspAuth: the scale sends `0x00 || challenge[16]` and
+   * withholds every 0x10 weight frame until it receives
+   * `0x01 || E1(linkKey, challenge, addr)`. The transform and its two static
+   * constants were established by @hedoric in #235 from an HCI capture of five
+   * complete vendor-app weigh-ins, and `jieli-auth.ts` reproduces all ten
+   * captured challenge/response pairs plus the Bluetooth specification's own E1
+   * sample vectors.
+   *
+   * Only the scale-issued exchange is answered. The vendor app also issues its
+   * own challenge to the scale first, but the capture shows the scale streams
+   * weight without it, and generating a nonce whose answer we would then have to
+   * validate adds a failure mode for nothing.
+   *
+   * Kept best-effort on purpose: a scale whose firmware uses a different key
+   * simply stays silent exactly as it does today, and the AE00 service is also
+   * present on ES-CS20M firmware that already reads fine.
    */
-  private noteAe00Challenge(): void {
-    if (this.ae00ChallengeSeen) return;
-    this.ae00ChallengeSeen = true;
-    bleLog.debug(
-      'QN: AE00 challenge frame received on AE02 and no response is sent. Scales that ' +
-        'gate measurement frames behind this challenge then stay silent on FFF1. If this ' +
-        'session produces no weight, attach an HCI snoop of the vendor app completing one ' +
-        'weigh-in to #235 so the response can be decoded.',
-    );
+  private answerAe00Challenge(data: Buffer): void {
+    if (this.ae00ResponsesSent >= MAX_AE00_RESPONSES) {
+      if (this.ae00ResponsesSent === MAX_AE00_RESPONSES) {
+        this.ae00ResponsesSent++;
+        bleLog.warn(
+          `QN: the scale re-issued the AE00 challenge more than ${MAX_AE00_RESPONSES} times, ` +
+            'so it is rejecting our response. This firmware likely uses a different ' +
+            'authentication key; please attach a DEBUG log to #235.',
+        );
+      }
+      return;
+    }
+
+    // Count the attempt before it can fail: a challenge shape this code cannot
+    // answer must still consume the budget, or a malformed repeat would be
+    // retried for the whole session.
+    this.ae00ResponsesSent++;
+    let frame: Buffer;
+    try {
+      frame = jieliAuthResponseFrame(data);
+    } catch (e: unknown) {
+      bleLog.debug(`QN: AE00 challenge response could not be computed: ${errMsg(e)}`);
+      return;
+    }
+    if (!this.ae00ChallengeSeen) {
+      this.ae00ChallengeSeen = true;
+      bleLog.debug('QN: AE00 challenge received, answering on AE01 (#235)');
+    }
+    void this.writeAe01([...frame]);
   }
 
   parseNotification(data: Buffer): ScaleReading | null {
