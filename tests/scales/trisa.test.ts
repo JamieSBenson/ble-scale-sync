@@ -286,6 +286,104 @@ describe('TrisaAdapter', () => {
       expect(withResponse).toBe(true);
     });
 
+    // #138: on Linux the CCCD write and onConnected() run in parallel, so the
+    // scale's challenge can land before the write function exists. It used to be
+    // dropped without even a log line, and the scale then waited for an ack that
+    // never came, once per cycle, forever.
+    it('queues a challenge that arrives before onConnected and sends it on connect', async () => {
+      const adapter = makeAdapter();
+      const uploadUuid = uuid16(0x8a82);
+
+      // Force the ADE variant without a connection, exactly as the real
+      // notification ordering does.
+      const { ctx, writeFn } = ctxWithChars(ADE_CHARS);
+      adapter.parseCharNotification!(uploadUuid, Buffer.from([0xa1, 0x01, 0x00, 0x3c, 0x90]));
+      expect(writeFn).not.toHaveBeenCalled();
+
+      await adapter.onConnected!(ctx);
+
+      const acks = writeFn.mock.calls.filter(
+        (c: unknown[]) => Array.from(c[1] as Buffer)[0] === 0x20,
+      );
+      expect(acks).toHaveLength(1);
+      expect(Array.from(acks[0][1] as Buffer)).toEqual([0x20, 0x01, 0x00, 0x3c, 0x90]);
+    });
+
+    // #138: a bare `void writeFn(...)` here meant a BlueZ `InProgress` rejection
+    // had nothing attached to it, and Node terminated the whole process.
+    // `InProgress` is also transient, so the ack is retried on the same link
+    // rather than deferred to a session the scale has already forgotten.
+    it('retries a rejected challenge-response write, then gives up quietly', async () => {
+      const adapter = makeAdapter();
+      const { ctx, writeFn } = ctxWithChars(ADE_CHARS);
+      await adapter.onConnected!(ctx);
+      writeFn.mockClear();
+      writeFn.mockRejectedValue(new Error('org.bluez.Error.InProgress'));
+
+      const uploadUuid = uuid16(0x8a82);
+      expect(() =>
+        adapter.parseCharNotification!(uploadUuid, Buffer.from([0xa1, 0x01, 0x00, 0xb8, 0x99])),
+      ).not.toThrow();
+
+      // Let every retry settle: an unhandled rejection fails the run.
+      await new Promise((r) => setTimeout(r, 800));
+      expect(writeFn.mock.calls.length).toBe(3); // initial + 2 retries
+    });
+
+    it('recovers the ack on a retry when the first write hits InProgress', async () => {
+      const adapter = makeAdapter();
+      const { ctx, writeFn } = ctxWithChars(ADE_CHARS);
+      await adapter.onConnected!(ctx);
+      writeFn.mockClear();
+      writeFn.mockRejectedValueOnce(new Error('org.bluez.Error.InProgress'));
+
+      adapter.parseCharNotification!(uuid16(0x8a82), Buffer.from([0xa1, 0x01, 0x00, 0xb8, 0x99]));
+      await new Promise((r) => setTimeout(r, 400));
+
+      expect(writeFn.mock.calls.length).toBe(2);
+      expect(Array.from(writeFn.mock.calls[1][1] as Buffer)).toEqual([
+        0x20, 0x01, 0x00, 0xb8, 0x99,
+      ]);
+    });
+
+    // The adapter is a shared singleton, so without a teardown signal the
+    // pre-connect queue would arm exactly once per process (#138).
+    it('re-arms the pre-connect queue after a session ends', async () => {
+      const adapter = makeAdapter();
+      const uploadUuid = uuid16(0x8a82);
+      const first = ctxWithChars(ADE_CHARS);
+      await adapter.onConnected!(first.ctx);
+      adapter.onSessionEnd!();
+
+      // Second cycle: the challenge again beats onConnected.
+      first.writeFn.mockClear();
+      adapter.parseCharNotification!(uploadUuid, Buffer.from([0xa1, 0x02, 0x00, 0x11, 0x22]));
+      expect(first.writeFn).not.toHaveBeenCalled(); // must NOT use the dead session's writer
+
+      const second = ctxWithChars(ADE_CHARS);
+      await adapter.onConnected!(second.ctx);
+      const acks = second.writeFn.mock.calls.filter(
+        (c: unknown[]) => Array.from(c[1] as Buffer)[0] === 0x20,
+      );
+      expect(acks).toHaveLength(1);
+      expect(Array.from(acks[0][1] as Buffer)).toEqual([0x20, 0x02, 0x00, 0x11, 0x22]);
+    });
+
+    it('drops a challenge left over from a previous session', async () => {
+      const adapter = makeAdapter();
+      const uploadUuid = uuid16(0x8a82);
+      // Queued before any connection, then the session ends without answering.
+      adapter.parseCharNotification!(uploadUuid, Buffer.from([0xa1, 0xde, 0xad, 0xbe, 0xef]));
+      adapter.onSessionEnd!();
+
+      const { ctx, writeFn } = ctxWithChars(ADE_CHARS);
+      await adapter.onConnected!(ctx);
+      const acks = writeFn.mock.calls.filter(
+        (c: unknown[]) => Array.from(c[1] as Buffer)[0] === 0x20,
+      );
+      expect(acks).toHaveLength(0);
+    });
+
     it('ignores ADE upload frames that are not 0xA1 challenges', async () => {
       const adapter = makeAdapter();
       const { ctx, writeFn } = ctxWithChars(ADE_CHARS);

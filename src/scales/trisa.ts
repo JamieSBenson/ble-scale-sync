@@ -11,7 +11,7 @@ import type {
 } from '../interfaces/scale-adapter.js';
 import { uuid16, buildPayload, type ScaleBodyComp } from './body-comp-helpers.js';
 import { matchesDescriptor, type MatchDescriptor } from './match-descriptor.js';
-import { bleLog } from '../ble/types.js';
+import { bleLog, errMsg } from '../ble/types.js';
 
 // Original Trisa firmware exposes 0x8A21 (notify) for measurement.
 const CHR_MEASUREMENT_TRISA = uuid16(0x8a21);
@@ -45,6 +45,14 @@ const OP_RESPONSE_TRISA = 0xa1;
 const OP_RESPONSE_ADE = 0x20;
 
 const EPOCH_2010 = 1262304000;
+
+/**
+ * Retry budget for a challenge-response write. BlueZ answers a badly timed
+ * write with a transient `org.bluez.Error.InProgress`, and the scale is waiting
+ * on that single ack (#138).
+ */
+const CHALLENGE_WRITE_RETRIES = 2;
+const CHALLENGE_RETRY_MS = 250;
 
 type Variant = 'trisa' | 'ade';
 
@@ -90,13 +98,28 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
   private password: Buffer | null = null;
   /** Reference to write function, saved from onConnected context. */
   private writeFn: ConnectionContext['write'] | null = null;
+  /** Challenge frame that arrived before the connection was ready (#138). */
+  private pendingChallenge: Buffer | null = null;
+  /**
+   * True once onConnected() has run for the current session.
+   *
+   * The adapter is a shared singleton, so `writeFn` alone cannot say whether a
+   * connection is live: it still holds the previous session's closure after a
+   * disconnect, and writing through that one throws.
+   */
+  private connected = false;
 
   matches(device: BleDeviceInfo): boolean {
     return matchesDescriptor(device, this.match);
   }
 
   async onConnected(ctx: ConnectionContext): Promise<void> {
+    // NOTE: pendingChallenge is deliberately NOT cleared here. The frame it
+    // holds arrived moments ago, before this method ran, and replaying it is the
+    // whole point (#138). Stale state from an earlier session is cleared in
+    // onSessionEnd() instead, which is where a session actually ends.
     this.writeFn = ctx.write;
+    this.connected = true;
 
     // Both measurement chars are declared `optional` so that variant detection
     // can pick whichever one the firmware exposes. If neither shows up, that
@@ -127,6 +150,32 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
     // Broadcast / pairing-complete opcode differs between variants.
     const broadcastOp = this.variant === 'ade' ? OP_BROADCAST_ADE : OP_BROADCAST_TRISA;
     await ctx.write(CHR_DOWNLOAD, [broadcastOp], true);
+
+    // Replay a challenge that beat this method to the notification handler, now
+    // that both the write function and the variant are known (#138).
+    const queued: Buffer | null = this.pendingChallenge;
+    if (queued) {
+      this.pendingChallenge = null;
+      bleLog.debug(`Replaying queued challenge: ${queued.toString('hex')}`);
+      this.handleUploadChannel(queued);
+    }
+  }
+
+  /**
+   * End of a GATT session: forget everything tied to it.
+   *
+   * `writeFn` is a closure over the connection that just went away, so anything
+   * written through it after this point is discarded by the transport (on the
+   * mqtt-proxy it is published into the void and even resolves successfully).
+   * Clearing `connected` is also what re-arms the pre-connect challenge queue
+   * for the next cycle; without it the #138 fix would work exactly once per
+   * process, which in continuous mode means once ever.
+   */
+  onSessionEnd(): void {
+    this.connected = false;
+    this.writeFn = null;
+    this.pendingChallenge = null;
+    this.password = null;
   }
 
   /**
@@ -210,12 +259,27 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
     if (data.length < 2) return;
     const opcode = data[0];
 
+    // On Linux the CCCD write and onConnected() run in parallel, so the scale's
+    // challenge can arrive before this adapter has a connection at all. Neither
+    // the write function nor the detected variant exists yet, and the frame used
+    // to be dropped without so much as a log line: the scale then waited for an
+    // ack that never came, once per cycle, forever (#138). Hold the raw frame
+    // and replay it from onConnected(), where both are known.
+    if (opcode === OP_CHALLENGE && !this.connected) {
+      this.pendingChallenge = Buffer.from(data);
+      bleLog.debug('Challenge arrived before connect completed; queued for replay');
+      return;
+    }
+
     if (this.variant === 'ade') {
-      if (opcode === OP_CHALLENGE && data.length >= 5 && this.writeFn) {
+      if (opcode === OP_CHALLENGE && data.length >= 5) {
         // Echo the four bytes that follow the opcode (XOR with savedPassword=0).
         const response = Buffer.from([OP_RESPONSE_ADE, data[1], data[2], data[3], data[4]]);
-        void this.writeFn(CHR_DOWNLOAD, response, true);
-        bleLog.debug(`ADE challenge ack sent: ${response.toString('hex')}`);
+        this.sendResponse(
+          response,
+          `ADE challenge ack sent: ${response.toString('hex')}`,
+          Buffer.from(data),
+        );
       } else {
         bleLog.debug(`ADE upload frame (unhandled opcode): ${data.toString('hex')}`);
       }
@@ -224,16 +288,54 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
 
     if (opcode === OP_PASSWORD) {
       this.password = Buffer.from(data.subarray(1));
-    } else if (opcode === OP_CHALLENGE && this.password && this.writeFn) {
+    } else if (opcode === OP_CHALLENGE && this.password) {
       const challenge = data.subarray(1);
       const response = Buffer.alloc(challenge.length + 1);
       response[0] = OP_RESPONSE_TRISA;
       for (let i = 0; i < challenge.length; i++) {
         response[i + 1] = challenge[i] ^ (this.password[i % this.password.length] ?? 0);
       }
-      // Fire-and-forget write; no need to await in notification handler
-      void this.writeFn(CHR_DOWNLOAD, response, true);
+      this.sendResponse(response, undefined, Buffer.from(data));
     }
+  }
+
+  /**
+   * Write a challenge response without awaiting it, but WITH a rejection
+   * handler.
+   *
+   * A bare `void writeFn(...)` here is what took the whole process down in
+   * #138: BlueZ answered the write with `org.bluez.Error.InProgress`, nothing
+   * was attached to the rejected promise, and Node killed the app on the
+   * unhandled rejection. In continuous mode that ends the service; only a
+   * container restart policy brought it back.
+   */
+  private sendResponse(response: Buffer, successLog?: string, replayOnFailure?: Buffer): void {
+    const write = this.writeFn;
+    if (!write) return;
+    const attempt = (retriesLeft: number): void => {
+      write(CHR_DOWNLOAD, response, true).then(
+        () => {
+          if (successLog) bleLog.debug(successLog);
+        },
+        (err: unknown) => {
+          // `org.bluez.Error.InProgress` is what #138 actually hit, and it is
+          // transient: another D-Bus operation was in flight on the same
+          // adapter. Retrying in-session is what answers the scale on THIS
+          // link; queueing for the next one answers a nonce it has forgotten.
+          if (retriesLeft > 0 && this.connected) {
+            bleLog.debug(`Challenge response write failed, retrying: ${errMsg(err)}`);
+            setTimeout(() => attempt(retriesLeft - 1), CHALLENGE_RETRY_MS);
+            return;
+          }
+          bleLog.debug(`Challenge response write failed: ${errMsg(err)}`);
+          // Out of retries: the link is most likely already gone. Keep the frame
+          // only while no newer one is waiting, so a late failure cannot clobber
+          // a fresher challenge.
+          if (replayOnFailure && !this.pendingChallenge) this.pendingChallenge = replayOnFailure;
+        },
+      );
+    };
+    attempt(CHALLENGE_WRITE_RETRIES);
   }
 
   /**
