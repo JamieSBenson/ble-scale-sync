@@ -6,7 +6,8 @@ import { bootstrapMqttProxy } from './ble/mqtt-proxy-bootstrap.js';
 import { notifyReady, startHeartbeat, stopHeartbeat } from './runtime/systemd-watchdog.js';
 import { touchHeartbeat, startFileHeartbeat, stopFileHeartbeat } from './runtime/file-heartbeat.js';
 import { armHardExit } from './runtime/hard-exit.js';
-import { adapters } from './scales/index.js';
+import { adapters as fullRegistry } from './scales/index.js';
+import { applyForcedAdapter, UnknownAdapterError } from './scales/force.js';
 import { assertRegistryIntegrity } from './scales/registry-check.js';
 import { createLogger, setLogLevel, LogLevel } from './logger.js';
 import { errMsg } from './utils/error.js';
@@ -15,6 +16,7 @@ import { loadAppConfig } from './config/load.js';
 import { resolveRuntimeConfig } from './config/resolve.js';
 import { startConfigWatcher, type ConfigWatcherHandle } from './config/watch.js';
 import type { Exporter } from './interfaces/exporter.js';
+import type { ScaleAdapter } from './interfaces/scale-adapter.js';
 import { createAppContext } from './runtime/context.js';
 import { processReading } from './runtime/processor.js';
 import { PollReadingSource } from './runtime/poll-source.js';
@@ -126,6 +128,37 @@ function onSignal(): void {
 process.on('SIGINT', onSignal);
 process.on('SIGTERM', onSignal);
 
+/**
+ * Keep a stray promise rejection from killing a long-running service.
+ *
+ * Node's default for an unhandled rejection is to terminate the process. The
+ * BLE stack is full of fire-and-forget writes into BlueZ, and BlueZ answers a
+ * badly timed one with `org.bluez.Error.InProgress`. In #138 that ended the
+ * whole app mid-session, every session, and only the container restart policy
+ * hid it: the scale was never read.
+ *
+ * Individual call sites still attach their own handlers; this is the net under
+ * them, not a licence to drop rejections. In single-run mode the exit code is
+ * preserved, because there the crash is the result.
+ */
+let runFinished = false;
+let rejectionCount = 0;
+process.on('unhandledRejection', (reason: unknown) => {
+  const detail = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+  // A single run that already exported its reading must not be turned into a
+  // failure by a fire-and-forget BLE write rejecting on the way out.
+  if (!initialResolved.continuousMode && !runFinished) {
+    log.error(`Unhandled promise rejection: ${detail}`);
+    stopHeartbeat();
+    process.exit(1);
+  }
+  rejectionCount++;
+  // Throttled: a permanently rejecting loop must not bury the log it is in.
+  if (rejectionCount <= 5 || rejectionCount % 50 === 0) {
+    log.warn(`Unhandled promise rejection #${rejectionCount} (continuing): ${detail}`);
+  }
+});
+
 let needsReload = false;
 
 if (process.platform !== 'win32') {
@@ -186,8 +219,41 @@ async function main(): Promise<void> {
   } else {
     log.info(`Scanning for any recognized scale...`);
   }
-  for (const w of assertRegistryIntegrity(adapters)) {
+  for (const w of assertRegistryIntegrity(fullRegistry)) {
     log.warn(`Adapter registry: ${w}`);
+  }
+
+  // ble.force_scale_adapter replaces the registry with the single adapter the
+  // user named, bypassing protocol detection entirely (#318/#319). The schema
+  // already requires scale_mac alongside it, so the override stays pointed at
+  // one device.
+  let adapters: ScaleAdapter[] = [...fullRegistry];
+  const forcedName = ctx.config.ble?.force_scale_adapter ?? undefined;
+  if (forcedName) {
+    // Checked here rather than in the schema because the effective MAC is only
+    // known after env overrides, and SCALE_MAC is the documented Docker way to
+    // supply it.
+    if (!ctx.scaleMac) {
+      log.error(
+        'ble.force_scale_adapter requires a scale MAC (ble.scale_mac or the SCALE_MAC ' +
+          'environment variable): the forced adapter matches every device it is shown, ' +
+          'so the MAC is what keeps it pointed at your scale.',
+      );
+      process.exit(1);
+    }
+    try {
+      adapters = applyForcedAdapter(fullRegistry, forcedName);
+    } catch (err) {
+      if (err instanceof UnknownAdapterError) {
+        log.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
+    log.warn(
+      `Scale adapter forced to "${adapters[0].name}" by config; protocol auto-detection is off. ` +
+        'If auto-detection picked the wrong adapter, please report it so the matcher can be fixed.',
+    );
   }
   log.info(`Adapters: ${adapters.map((a) => a.name).join(', ')}\n`);
 
@@ -238,6 +304,7 @@ async function main(): Promise<void> {
     const raw = await source.nextReading(ctx.signal);
     const success = await runProcessReading(raw);
     if (!success) process.exit(1);
+    runFinished = true;
     return;
   }
 
