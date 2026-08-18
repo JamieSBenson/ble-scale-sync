@@ -45,20 +45,43 @@ import type { MatchDescriptor } from './match-descriptor.js';
  *   [1]      0x0E payload length, i.e. the bytes after the 2-byte header
  *   [2]      0x00
  *   [3]      0xCF frame type
- *   [4..5]   varies per measurement, NOT impedance (see below)
+ *   [4..5]   impedance, LE, / 10 = ohm; zero when the scale ran no BIA
  *   [6..7]   weight LE / 100 = kg
- *   [8..10]  high entropy, no measurement meaning found
+ *   [8..10]  BIA-gated, meaning unknown (see below)
  *   [12]     0x00 when final (stable) reading
  *   [15]     XOR of bytes [2..14]
  *
- * Impedance is not decodable from this frame on the evidence available, and
- * offset [4..5] is actively disfavoured as a candidate. Across the three #289
- * samples (87.90 kg / 30.1 %, 87.50 kg / 29.5 %, 87.65 kg / 29.8 %) it reads
- * 4360, 4210, 4170 LE, which ranks in the wrong order against the reported body
- * fat, varies about five times more than the observed body fat spread allows,
- * and fits worse than assuming impedance is constant. Both the GATT and the
- * broadcast path stay weight-only and let the shared Deurenberg fallback
- * estimate composition.
+ * Impedance decode (#289, second pass). The first pass shipped weight-only and
+ * recorded [4..5] as "actively disfavoured", on three samples from one person
+ * whose body fat spanned 0.6 pp. That was too little signal, and the later
+ * samples settle it:
+ *
+ *   socks on,   88.00 kg, app reports no body fat -> [4..5] = 0,    [8..10] = 0
+ *   socks off,  88.00 kg, app reports 30.4 %      -> [4..5] = 4700, [8..10] = 11 13 f1
+ *   20 kg dumbbell,       app reports no body fat -> [4..5] = 0,    [8..10] = 0
+ *   person 2,   68.45 kg, app reports 42.4 %      -> [4..5] = 6770, [8..10] = 06 05 62
+ *   person 2 shod, 68.70 kg, no body fat          -> [4..5] = 0,    [8..10] = 0
+ *
+ * Both fields are zero exactly when the vendor app reports no body fat, so the
+ * BIA payload is in one of them. What separates them is the direction between
+ * the two people: impedance must be LOWER for the leaner, larger person, and
+ * [4..5] is (470 vs 677 ohm) while every reading of [8..10] makes person 1
+ * between 2.4x and 3.8x LARGER than person 2, which is the wrong sign for
+ * impedance and for every other body-composition quantity (fat, lean, muscle,
+ * water, bone were all checked). So [4..5] is the resistance and [8..10] stays
+ * undecoded.
+ *
+ * Scale is /10: raw ohms would be 4700, an order of magnitude above anything
+ * this project has seen from any scale, and /100 an order below.
+ *
+ * Accuracy caveat, worth knowing before comparing against the vendor app: our
+ * generic BIA coefficients are not Eufy's, so the derived body fat runs roughly
+ * 3-5 pp above what the app shows (33.8 % vs 30.4 % for the sample above). It
+ * is still closer than the weight-only Deurenberg estimate it replaces, whose
+ * error on the same samples is 2-8 pp in the other direction.
+ *
+ * The broadcast path stays weight-only: no advertisement sample carries these
+ * bytes.
  *
  * Advertisement frame (19 bytes of vendor data, company ID 0xFF48):
  *   [0..5] scale MAC
@@ -79,6 +102,22 @@ const SVC_UUID = uuid16(0xfff0);
 
 const AES_IV = Buffer.from('0000000000000000', 'ascii');
 const MIN_WEIGHT_KG = 2;
+/**
+ * Impedance band accepted from bytes [4..5] (#289). The floor is the same 200
+ * ohm isComplete() requires, so a value inside the band can never produce a
+ * reading the completeness gate then refuses; the ceiling is above every
+ * impedance this project has observed (330-600 ohm) with room to spare.
+ */
+const MIN_IMPEDANCE_OHM = 200;
+const MAX_IMPEDANCE_OHM = 1000;
+
+/**
+ * How far the weight may move (hundredths of kg) before a latched impedance is
+ * treated as belonging to somebody else. 2 kg is far wider than the drift of one
+ * person settling on the platform and far narrower than the gap between two
+ * people in a household.
+ */
+const LATCH_WEIGHT_TOLERANCE_RAW = 200;
 const MAX_WEIGHT_KG = 200;
 
 /**
@@ -310,13 +349,34 @@ export function parseWeightNotification(data: Buffer): ScaleReading | null {
   const isFinal = data[12] === 0x00;
   if (!isFinal) return null;
 
-  // Bytes 8..10 are NOT a usable resistance. The upstream reference
-  // (bdr99/eufylife-ble-client) keeps this decode commented out for T9148/T9149;
-  // real P2/P2 Pro hardware yields millions of Ohm here (#289), which
-  // computeBiaFat then clamps to a bogus fixed 60% body fat. Treat the GATT path
-  // as weight-only, exactly like the broadcast path (parseEufyAdvertisement), and
-  // let the shared BMI/Deurenberg fallback estimate body composition.
-  return { weight, impedance: 0 };
+  return { weight, impedance: parseImpedance(data) };
+}
+
+/**
+ * Impedance in ohm from bytes [4..5], or 0 when the frame carries no usable BIA.
+ *
+ * Three gates, each earning its place:
+ *   - the frame must pass its own length and XOR checks, because a corrupted
+ *     frame that still yields a plausible weight must not also inject a
+ *     resistance that silently rewrites the whole body composition;
+ *   - zero means the scale ran no BIA (bare feet missing, shoes on) and is the
+ *     normal case, not an error;
+ *   - anything outside the plausible band is dropped rather than published. A
+ *     bad resistance is worse than none: computeBiaFat clamps at 60 %, which is
+ *     exactly the nonsense the original #289 report showed. The band matches
+ *     both the 200 ohm floor isComplete() already enforces and the 330-600 ohm
+ *     range observed across every other adapter in this project.
+ */
+function parseImpedance(data: Buffer): number {
+  if (frameIntegrityProblems(data).length > 0) return 0;
+  const raw = (data[5] << 8) | data[4];
+  if (raw === 0) return 0;
+  const ohm = raw / 10;
+  if (ohm <= MIN_IMPEDANCE_OHM || ohm > MAX_IMPEDANCE_OHM) {
+    bleLog.debug(`Eufy: ignoring out-of-range impedance ${ohm} ohm (raw ${raw})`);
+    return 0;
+  }
+  return ohm;
 }
 
 /** Parse 19-byte advertisement vendor payload. Returns null if not a final reading. */
@@ -352,6 +412,11 @@ export class EufyP2Adapter
     { service: SVC_UUID, uuid: CHR_DATA, type: 'notify' },
     { service: SVC_UUID, uuid: CHR_AUTH, type: 'notify' },
   ];
+
+  /** Highest-confidence impedance seen this session (see latchImpedance). */
+  private sessionImpedance = 0;
+  /** Raw weight (hundredths of kg) the latched impedance was measured at. */
+  private sessionImpedanceRawWeight = 0;
 
   private auth: EufyAuthHandler | null = null;
   private ctx: ConnectionContext | null = null;
@@ -390,6 +455,8 @@ export class EufyP2Adapter
     this.previousFinalRawWeight = null;
     this.weightStable = false;
     this.frameIntegrityLogged = false;
+    this.sessionImpedance = 0;
+    this.sessionImpedanceRawWeight = 0;
     if (!ctx.deviceAddress) {
       bleLog.warn('Eufy: no device address available — auth will fail without MAC');
       return;
@@ -454,7 +521,39 @@ export class EufyP2Adapter
     const rawWeight = Math.round(reading.weight * 100);
     this.weightStable = this.previousFinalRawWeight === rawWeight;
     this.previousFinalRawWeight = rawWeight;
-    return reading;
+    return this.latchImpedance(reading, rawWeight);
+  }
+
+  /**
+   * Carry a measured impedance forward across the rest of the session.
+   *
+   * The BIA result and the settled weight do not have to arrive in the same
+   * frame, and the #284 stability gate resolves on two consecutive equal-weight
+   * final frames. Without the latch, a final frame that repeats the weight with
+   * [4..5] back at zero would resolve the session as weight-only and throw away
+   * a resistance the scale had already reported.
+   */
+  private latchImpedance(reading: ScaleReading, rawWeight: number): ScaleReading {
+    if (reading.impedance > 0) {
+      this.sessionImpedance = reading.impedance;
+      this.sessionImpedanceRawWeight = rawWeight;
+      return reading;
+    }
+    if (this.sessionImpedance === 0) return reading;
+    // Only carry it to the same body. One connection can outlive the person who
+    // opened it: the session resolves on two consecutive equal-weight final
+    // frames, so if someone steps off before that happens and someone else steps
+    // on, an unlatched carry-forward would export person A's resistance against
+    // person B's weight, and body composition is computed from exactly that
+    // pair.
+    if (Math.abs(rawWeight - this.sessionImpedanceRawWeight) > LATCH_WEIGHT_TOLERANCE_RAW) {
+      bleLog.debug(
+        `Eufy: not carrying impedance ${this.sessionImpedance} ohm across a ` +
+          `${(Math.abs(rawWeight - this.sessionImpedanceRawWeight) / 100).toFixed(2)} kg change`,
+      );
+      return reading;
+    }
+    return { ...reading, impedance: this.sessionImpedance };
   }
 
   parseBroadcast(manufacturerData: Buffer): ScaleReading | null {
@@ -462,10 +561,10 @@ export class EufyP2Adapter
   }
 
   isComplete(reading: ScaleReading): boolean {
-    // Both paths are weight-only: the broadcast advertisement carries no BIA, and
-    // the GATT frame's bytes 8..10 are not a usable resistance (#289), so
-    // parseWeightNotification also emits impedance 0. The impedance>0 branch is a
-    // defensive no-op kept for a future real-impedance decode.
+    // Impedance 0 is normal, not a failure: the broadcast advertisement carries
+    // no BIA at all, and over GATT the scale reports 0 whenever it could not
+    // measure a resistance (shoes, socks, a dumbbell). Those readings still
+    // complete on weight alone and fall back to the profile estimate.
     if (reading.impedance === 0) return reading.weight > 0;
     return reading.weight > MIN_WEIGHT_KG && reading.impedance > 200;
   }

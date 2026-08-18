@@ -1,3 +1,4 @@
+import type { ConnectionContext } from '../../src/interfaces/scale-adapter.js';
 import { describe, it, expect, vi } from 'vitest';
 import { createCipheriv, createHash } from 'node:crypto';
 import {
@@ -352,8 +353,8 @@ describe('SegmentReassembler', () => {
 
 /**
  * Three real P2 Pro FFF2 frames supplied in #289, each with the body fat the
- * Eufy app reported for the same weigh-in. They pin the frame layout and are
- * the executable record of why the impedance decode was rejected.
+ * Eufy app reported for the same weigh-in. They pin the frame layout and the
+ * impedance decode (#289).
  */
 const REAL_FRAMES = [
   {
@@ -378,9 +379,12 @@ describe('#289 real P2 Pro frames', () => {
     for (const f of REAL_FRAMES) expect(f.buf.length).toBe(16);
   });
 
-  it('decodes the app-reported weight, weight only', () => {
+  it('decodes the app-reported weight and the impedance at [4..5] / 10', () => {
     for (const f of REAL_FRAMES) {
-      expect(parseWeightNotification(f.buf)).toEqual({ weight: f.weight, impedance: 0 });
+      expect(parseWeightNotification(f.buf)).toEqual({
+        weight: f.weight,
+        impedance: f.buf.readUInt16LE(4) / 10,
+      });
     }
   });
 
@@ -396,13 +400,97 @@ describe('#289 real P2 Pro frames', () => {
     for (const f of REAL_FRAMES) expect(frameIntegrityProblems(f.buf)).toEqual([]);
   });
 
-  it('offset [4..5] does not rank with body fat, so it is not the impedance', () => {
-    const byFat = [...REAL_FRAMES].sort((a, b) => a.appFat - b.appFat);
-    const candidates = byFat.map((f) => f.buf.readUInt16LE(4));
-    expect(candidates).toEqual([4210, 4170, 4360]);
-    // A real impedance must rise with body fat. It does not: the middle two swap.
-    const monotonic = candidates.every((v, i) => i === 0 || v >= candidates[i - 1]);
-    expect(monotonic).toBe(false);
+  // The frames below are the ones that settled the #289 decode. Bytes [4..5]
+  // and [8..10] are both zero exactly when the vendor app reported no body fat,
+  // so one of them carries the BIA payload; what picks [4..5] is the direction
+  // between the two people. Person 1 (88.00 kg, app 30.4 %) must have the LOWER
+  // resistance of the two, and [4..5] says so (470 vs 677 ohm) while every
+  // reading of [8..10] makes person 1 the larger by 2.4x to 3.8x.
+  const BIA_FRAMES = {
+    person1: Buffer.from([
+      0xcf, 0x0e, 0x00, 0xcf, 0x5c, 0x12, 0x60, 0x22, 0x11, 0x13, 0xf1, 0, 0, 0, 0, 0x30,
+    ]),
+    person2: Buffer.from([
+      0xcf, 0x0e, 0x00, 0xcf, 0x72, 0x1a, 0xbd, 0x1a, 0x06, 0x05, 0x62, 0, 0, 0, 0, 0x61,
+    ]),
+    socksOn: Buffer.from([
+      0xcf, 0x0e, 0x00, 0xcf, 0x00, 0x00, 0x60, 0x22, 0, 0, 0, 0, 0, 0, 0, 0x8d,
+    ]),
+    shod: Buffer.from([0xcf, 0x0e, 0x00, 0xcf, 0x00, 0x00, 0xd6, 0x1a, 0, 0, 0, 0, 0, 0, 0, 0x03]),
+  };
+
+  it('decodes impedance from the two sessions where the app reported body fat', () => {
+    expect(parseWeightNotification(BIA_FRAMES.person1)).toEqual({ weight: 88, impedance: 470 });
+    expect(parseWeightNotification(BIA_FRAMES.person2)).toEqual({ weight: 68.45, impedance: 677 });
+  });
+
+  it('reports impedance 0 for the sessions where the app reported none', () => {
+    expect(parseWeightNotification(BIA_FRAMES.socksOn)).toEqual({ weight: 88, impedance: 0 });
+    expect(parseWeightNotification(BIA_FRAMES.shod)).toEqual({ weight: 68.7, impedance: 0 });
+  });
+
+  it('person 1 measures the lower resistance, which is what rules out [8..10]', () => {
+    const r1 = BIA_FRAMES.person1.readUInt16LE(4);
+    const r2 = BIA_FRAMES.person2.readUInt16LE(4);
+    expect(r1).toBeLessThan(r2);
+    // Every reading of [8..10] has the opposite (wrong) ordering.
+    expect(BIA_FRAMES.person1.readUInt16LE(8)).toBeGreaterThan(BIA_FRAMES.person2.readUInt16LE(8));
+  });
+
+  it('drops an out-of-range resistance rather than publishing a clamped body fat', () => {
+    const buf = Buffer.from(BIA_FRAMES.person1);
+    buf.writeUInt16LE(20000, 4); // 2000 ohm, above the accepted band
+    buf[15] = xorChecksum(buf, 2, 15);
+    expect(parseWeightNotification(buf)).toEqual({ weight: 88, impedance: 0 });
+  });
+
+  // The BIA result and the settled weight need not arrive in the same frame, and
+  // the #284 stability gate resolves on two consecutive equal-weight final
+  // frames. Without the latch, the second frame would export weight-only.
+  it('carries a measured impedance across later zero-BIA frames in the session', () => {
+    const adapter = new EufyP2Adapter();
+    expect(adapter.parseNotification(BIA_FRAMES.person1)?.impedance).toBe(470);
+    const later = Buffer.from(BIA_FRAMES.person1);
+    later.writeUInt16LE(0, 4);
+    later[15] = xorChecksum(later, 2, 15);
+    expect(adapter.parseNotification(later)).toEqual({ weight: 88, impedance: 470 });
+  });
+
+  it('does not carry the impedance onto a different body', () => {
+    const adapter = new EufyP2Adapter();
+    expect(adapter.parseNotification(BIA_FRAMES.person1)?.impedance).toBe(470);
+    // Person 2 steps on during the same connection with no BIA of their own.
+    const other = Buffer.from(BIA_FRAMES.person2);
+    other.writeUInt16LE(0, 4);
+    other[15] = xorChecksum(other, 2, 15);
+    expect(adapter.parseNotification(other)).toEqual({ weight: 68.45, impedance: 0 });
+  });
+
+  it('clears the latched impedance when a new session starts', async () => {
+    const adapter = new EufyP2Adapter();
+    expect(adapter.parseNotification(BIA_FRAMES.person1)?.impedance).toBe(470);
+
+    // A fresh connection must not inherit it: adapters are shared singletons.
+    await adapter.onConnected!({
+      profile: { height: 180, age: 30, gender: 'male', isAthlete: false },
+      deviceAddress: '',
+      availableChars: new Set<string>(),
+      write: async () => {},
+      read: async () => Buffer.alloc(0),
+      subscribe: async () => {},
+    } as unknown as ConnectionContext).catch(() => {});
+
+    const zeroBia = Buffer.from(BIA_FRAMES.person1);
+    zeroBia.writeUInt16LE(0, 4);
+    zeroBia[15] = xorChecksum(zeroBia, 2, 15);
+    expect(adapter.parseNotification(zeroBia)).toEqual({ weight: 88, impedance: 0 });
+  });
+
+  it('drops the impedance (but keeps the weight) when the frame fails its XOR', () => {
+    const buf = Buffer.from(BIA_FRAMES.person1);
+    buf[15] = 0xff;
+    expect(frameIntegrityProblems(buf).join()).toContain('xor');
+    expect(parseWeightNotification(buf)).toEqual({ weight: 88, impedance: 0 });
   });
 });
 
