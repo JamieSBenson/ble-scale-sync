@@ -1,4 +1,4 @@
-import type { ScaleAdapter, UserProfile } from '../../interfaces/scale-adapter.js';
+import type { BleDeviceInfo, ScaleAdapter, UserProfile } from '../../interfaces/scale-adapter.js';
 import type { MqttProxyConfig } from '../../config/schema.js';
 import type { RawReading } from '../shared.js';
 import { waitForRawReading } from '../shared.js';
@@ -75,6 +75,20 @@ export class ReadingWatcher implements Watcher {
   private currentDevice: MqttBleDevice | null = null;
   private gattStartedAt = 0;
   private readonly dedup = new DedupWindow(DEDUP_WINDOW_MS);
+  /**
+   * Last scan result seen per address, keyed lowercase.
+   *
+   * The ESP32's `connected` payload carries only the address and the discovered
+   * characteristics, so an autonomous connect used to resolve against a device
+   * with no name and no services at all. Adapters that identify by name then
+   * cannot match, and selection fell through to a priority-ordered notify-char
+   * scan: a Renpho ES-26BB (2a10 notify, no 2a12) was handed to the R-MSC04
+   * adapter purely because it has the higher priority and claims the same
+   * notify characteristic (#317). The scan results that precede the connect
+   * carry the name; keeping the last one makes the autonomous path resolve on
+   * the same information as every other transport.
+   */
+  private readonly lastScanEntry = new Map<string, ScanResultEntry>();
   /** Weight-only fallback timer per address; on elapse the held reading is queued. */
   private readonly grace = new GraceTimers(IMPEDANCE_GRACE_MS, (address, gr) => {
     bleLog.info(
@@ -206,6 +220,7 @@ export class ReadingWatcher implements Watcher {
           : results;
 
         for (const entry of candidates) {
+          this.rememberScanEntry(entry);
           const info = toBleDeviceInfo(entry);
           const adapter = resolveAdapter(info, this.adapters);
           if (!adapter) continue;
@@ -342,6 +357,9 @@ export class ReadingWatcher implements Watcher {
 
   private static readonly GATT_STALE_MS = 90_000;
 
+  /** Upper bound on remembered advertisements (see rememberScanEntry). */
+  private static readonly SCAN_CACHE_MAX = 64;
+
   /**
    * Number of consecutive auto_connect deferrals for one MAC before the watcher
    * falls back to a host-initiated GATT connect (#231). Generous enough that a
@@ -349,6 +367,46 @@ export class ReadingWatcher implements Watcher {
    * never-firing autonomous path (auto-discovery / no scale_mac) reaches it.
    */
   private static readonly AUTO_CONNECT_FALLBACK_DEFERS = 3;
+
+  /**
+   * Remember the newest advertisement for an address, evicting the oldest entry
+   * past the cap. A busy room can put hundreds of devices through this handler
+   * every few seconds and the watcher runs for weeks at a time.
+   */
+  private rememberScanEntry(entry: ScanResultEntry): void {
+    const key = entry.address.toLowerCase();
+    this.lastScanEntry.delete(key);
+    this.lastScanEntry.set(key, entry);
+    while (this.lastScanEntry.size > ReadingWatcher.SCAN_CACHE_MAX) {
+      const oldest = this.lastScanEntry.keys().next().value;
+      if (oldest === undefined) break;
+      this.lastScanEntry.delete(oldest);
+    }
+  }
+
+  /**
+   * Pick the adapter that drives the read once the characteristics are known.
+   * Falls back to the pre-discovery choice when nothing matches.
+   *
+   * Not a guaranteed improvement: `matchesDescriptor` is a pure OR of positive
+   * claims, so adding characteristics can only make MORE adapters match, and the
+   * highest-priority one of them wins. That is the same trade the node-ble and
+   * esphome paths already make, and it is what lets a structural matcher correct
+   * an advertisement-time guess.
+   */
+  private reresolveAfterDiscovery(
+    info: BleDeviceInfo,
+    fallback: ScaleAdapter,
+    address: string,
+  ): ScaleAdapter {
+    const resolved = resolveAdapter(info, this.adapters) ?? fallback;
+    if (resolved.name !== fallback.name) {
+      bleLog.info(
+        `Re-resolved adapter after GATT discovery: ${fallback.name} -> ${resolved.name} (${address})`,
+      );
+    }
+    return resolved;
+  }
 
   private async handleGattReading(entry: ScanResultEntry, adapter: ScaleAdapter): Promise<void> {
     if (this.gattInProgress) {
@@ -367,6 +425,9 @@ export class ReadingWatcher implements Watcher {
     const t = topics(this.config.topic_prefix, this.config.device_id);
     let client: MqttClient | undefined;
     let device: MqttBleDevice | undefined;
+    // Hoisted so the caller's failure log can name the adapter that actually
+    // drove the read, which is the fact #317/#319 were both missing.
+    let gattAdapter: ScaleAdapter = adapter;
     // Guard the whole connect+read sequence: if mqttGattConnect (or the client
     // lookup) throws, the finally must still clear gattInProgress — otherwise a
     // single failed connect blocks every later GATT retry until the 90s
@@ -390,11 +451,28 @@ export class ReadingWatcher implements Watcher {
       const connected = await mqttGattConnect(client, t, entry.address, entry.addr_type ?? 0);
       device = connected.device;
       this.currentDevice = device;
+      // Re-resolve char-aware now that GATT discovery is complete (#319). The
+      // advertisement-time match sees a bare vendor service and can land on an
+      // adapter wanting characteristics the device does not expose: a Eufy A1
+      // (fff1 + fff4, no fff2) was driven by Inlife or QN and died on the
+      // missing write char. Every other transport already does this (#177
+      // node-ble, #251 esphome, #258 this handler's autonomous path); the
+      // host-initiated path was the one that was missed.
+      //
+      // The scan entry is spread in first: dropping name and services here
+      // would strip every name-matched adapter of its match and collapse
+      // resolution onto structural matchers only.
+      gattAdapter = this.reresolveAfterDiscovery(
+        { ...toBleDeviceInfo(entry), characteristicUuids: [...connected.charMap.keys()] },
+        adapter,
+        entry.address,
+      );
+      bleLog.debug(`GATT read driven by adapter: ${gattAdapter.name} (${entry.address})`);
       const raw = await withTimeout(
         waitForRawReading(
           connected.charMap,
           device,
-          adapter,
+          gattAdapter,
           profile,
           entry.address.replace(/[:-]/g, '').toUpperCase(),
         ),
@@ -455,8 +533,14 @@ export class ReadingWatcher implements Watcher {
       // generic fff1/fff2 pair; without the structural pass the higher-priority
       // Eufy P2 adapter stole it via its fff2 notify char and then failed on the
       // missing fff4 (#258).
-      const info = toBleDeviceInfo({ address: data.address, name: '', rssi: 0, services: [] });
+      const cached = this.lastScanEntry.get(data.address.toLowerCase());
+      const info = toBleDeviceInfo(
+        cached ?? { address: data.address, name: '', rssi: 0, services: [] },
+      );
       info.characteristicUuids = data.chars.map((c) => c.uuid.toLowerCase());
+      if (cached?.name) {
+        bleLog.debug(`Autonomous connect: using cached advertisement name "${cached.name}"`);
+      }
       let adapter = resolveAdapter(info, this.adapters);
       if (!adapter) {
         // No structural match: fall back to a priority-ordered notify-char scan
