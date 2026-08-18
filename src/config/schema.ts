@@ -114,6 +114,12 @@ export const BleSchema = z
       .regex(/^hci\d+$/, 'Must be a Linux HCI adapter name (e.g., hci0, hci1)')
       .optional()
       .nullable(),
+    /**
+     * Override protocol auto-detection with a named scale adapter (#318/#319).
+     * Note the distinction from `adapter` above, which selects the host's
+     * Bluetooth controller: this one selects the scale protocol.
+     */
+    force_scale_adapter: z.string().min(1).optional().nullable(),
     mqtt_proxy: MqttProxySchema.optional(),
     esphome_proxy: EsphomeProxySchema.optional(),
   })
@@ -125,6 +131,11 @@ export const BleSchema = z
     message: 'esphome_proxy config is required when handler is "esphome-proxy"',
     path: ['esphome_proxy'],
   });
+// NOTE: force_scale_adapter also requires a scale_mac, but that pairing is NOT
+// checked here. Schema validation runs before applyEnvOverrides (yaml-load.ts),
+// so a config.yaml that names a forced adapter and takes its MAC from the
+// documented SCALE_MAC Docker override would be rejected while being perfectly
+// valid. The check lives in src/index.ts, after the effective MAC is known.
 
 export const ScaleSchema = z.object({
   weight_unit: z.enum(['kg', 'lbs']).default('kg'),

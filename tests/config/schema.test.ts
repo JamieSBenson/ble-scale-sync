@@ -349,6 +349,26 @@ describe('BleSchema', () => {
     }
   });
 
+  // #318/#319: the escape hatch for a device auto-detection routes to the wrong
+  // protocol adapter. It matches every device it is shown, so scale_mac is what
+  // keeps it aimed at one scale.
+  it('accepts force_scale_adapter together with scale_mac', () => {
+    const result = BleSchema.safeParse({
+      scale_mac: 'AA:BB:CC:DD:EE:FF',
+      force_scale_adapter: 'Hutbit',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.force_scale_adapter).toBe('Hutbit');
+  });
+
+  // The scale_mac pairing is enforced in src/index.ts, not here: schema
+  // validation runs before env overrides, so rejecting it at parse time would
+  // break the documented `docker run -e SCALE_MAC=...` setup.
+  it('accepts force_scale_adapter without scale_mac at schema level', () => {
+    const result = BleSchema.safeParse({ force_scale_adapter: 'Hutbit' });
+    expect(result.success).toBe(true);
+  });
+
   it('rejects handler mqtt-proxy without mqtt_proxy config', () => {
     const result = BleSchema.safeParse({ handler: 'mqtt-proxy' });
     expect(result.success).toBe(false);
