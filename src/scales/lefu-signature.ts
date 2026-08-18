@@ -45,15 +45,24 @@ const SVC_D618 = 'd618';
 
 /**
  * True when the advertisement carries the Lefu OEM stock fingerprint of a
- * Hutbit 218008: manufacturer data under company id 0x02AC whose payload is
- * 7 bytes ending in a status byte (0x00 idle / 0x01 active), advertised
- * alongside both the FFB0 and D618 services.
+ * Hutbit 218008: manufacturer data under company id 0x02AC whose payload is the
+ * device's own MAC reversed, optionally followed by a status byte
+ * (0x00 idle / 0x01 active), advertised alongside both the FFB0 and D618
+ * services.
  *
- * The 7-byte payload is the device's own MAC reversed plus that status byte
- * (nRF capture in #278: `7EB893ECB303|01` for MAC 03:B3:EC:93:B8:7E). Only the
- * shape is checked, not the MAC itself: `BleDeviceInfo` carries no address
- * field, and a MAC check would not disambiguate anyway, since every device in
- * this family reverses its own MAC.
+ * Two payload shapes are attested by hardware:
+ *
+ *   7 bytes  `7EB893ECB303|01`  MAC 03:B3:EC:93:B8:7E, nRF capture in #278
+ *   6 bytes  `12A291ECB303`     MAC 03:B3:EC:91:A2:12, debug log in #318
+ *
+ * The 6-byte form omits the status byte entirely. Requiring 7 was what sent
+ * #318's unit to the MGB adapter, whose parser rejects every AC02 frame this
+ * family sends, so the length check accepts both and the status byte is only
+ * validated when it is present.
+ *
+ * Only the shape is checked, not the MAC itself: `BleDeviceInfo` carries no
+ * address field, and a MAC check would not disambiguate anyway, since every
+ * device in this family reverses its own MAC.
  *
  * Why an advertisement fingerprint at all: the branded unit advertises
  * "Hutbit Scale", but Lefu OEM stock advertises "SWAN", and over the ESPHome
@@ -64,8 +73,8 @@ const SVC_D618 = 'd618';
 export function isHutbitOemAdvert(device: BleDeviceInfo): boolean {
   const m = device.manufacturerData;
   if (m?.id !== LEFU_COMPANY_ID) return false;
-  if (m.data.length !== 7) return false;
-  if (m.data[6] !== 0x00 && m.data[6] !== 0x01) return false;
+  if (m.data.length !== 6 && m.data.length !== 7) return false;
+  if (m.data.length === 7 && m.data[6] !== 0x00 && m.data[6] !== 0x01) return false;
   return (
     uuidClaimHits([SVC_FFB0], device.serviceUuids) && uuidClaimHits([SVC_D618], device.serviceUuids)
   );
