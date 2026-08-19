@@ -127,7 +127,7 @@ export const BleSchema = z
      * shorter session frees the scale sooner. The cost is proportionally more
      * Bluetooth adapter resets per hour, since every failed read triggers one.
      */
-    session_timeout_sec: z.number().int().min(5).max(600).optional(),
+    session_timeout_sec: z.number().int().min(5).max(600).optional().nullable(),
     mqtt_proxy: MqttProxySchema.optional(),
     esphome_proxy: EsphomeProxySchema.optional(),
   })

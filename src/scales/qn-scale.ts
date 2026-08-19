@@ -63,11 +63,18 @@ const hex = (data: number[] | Buffer): string =>
  *   [2]     protocol type (echoed back in all config commands)
  *   [10]    weight scale flag (1 = /100, else /10)
  *
- * 0x12 frame (ES-26M long format, 18 bytes):
- *   [1]     length (== packet length, i.e. 0x12 == 18)
- *   [2-7]   MAC address (NOT protocol type!)
- *   Protocol type should be set to 0x00 for this variant.
+ * 0x12 frame (long format, byte[1] == packet length):
+ *   [1]     length (18 on the Renpho ES-26M, 20 on the GE CS 10 G)
+ *   [2]     protocol/verify byte (0xff on every captured frame)
+ *   [3-8]   MAC address, little endian
  *   Weight scale factor is 10 (ES-30M format with heuristic /100 fallback).
+ *
+ *   The two dialects agree on the layout and differ in the value the firmware
+ *   ACCEPTS BACK. The 18-byte ES-26M was hardware verified rejecting 0xff and
+ *   working on 0x00 (45e4d6e); on the 20-byte GE CS 10 G the vendor app echoes
+ *   0xff, and its 0x22 start command is then byte identical to ours (#235).
+ *   Note that only the 0x22 matches the app byte for byte: the app's 0x13 and
+ *   0x20 are each one byte longer than ours, and that delta is still unexplained.
  */
 
 // Type 2 UUIDs (most common variant)
@@ -652,6 +659,8 @@ export class QnScaleAdapter
         this.weightScaleFactor = 10;
       } else {
         // Classic short frame
+        this.isLongFrameVariant = false;
+        this.isExtendedLongFrame = false;
         this.seenProtocolType = data[2];
         this.weightScaleFactor = data[10] === 1 ? 100 : 10;
       }

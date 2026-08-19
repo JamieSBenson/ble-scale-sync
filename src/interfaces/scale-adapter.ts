@@ -39,6 +39,12 @@ export interface UserProfile {
   age: number;
   gender: Gender;
   isAthlete: boolean;
+  /**
+   * ISO birth date (YYYY-MM-DD) when config supplied one. Body composition uses
+   * `age`; this exists for scales that store a date of birth on the device, so
+   * provisioning does not have to invent a 1 January anniversary (#229).
+   */
+  birthDate?: string;
 }
 
 export interface BodyComposition {

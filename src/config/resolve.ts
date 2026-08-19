@@ -40,6 +40,7 @@ export function resolveUserProfile(user: UserConfig, scaleConfig: ScaleConfig): 
     age: computeAge(user.birth_date),
     gender: user.gender,
     isAthlete: user.is_athlete,
+    birthDate: user.birth_date,
   };
 }
 

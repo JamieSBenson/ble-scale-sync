@@ -655,11 +655,16 @@ describe('BeurerBf720Adapter', () => {
       expect(writes.map((w) => w[0])).toContain(DBINC);
     });
 
-    it('warns instead of writing when provisioning is off', async () => {
+    // With provisioning off the bytes on the wire are exactly what they were
+    // before the option existed: the empty value is still committed back. Only
+    // the warning is new. Changing which characteristics get written on an
+    // install that never opted in would be an undeclared behaviour change.
+    it('warns but still writes the empty value back when provisioning is off', async () => {
       const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
       const a = makeAdapter();
       const writes = await writesAfterConsent(a, ctxWith(ZEROED));
-      expect(writes.map((w) => w[0])).not.toContain(DOB);
+      const dob = writes.find((w) => w[0] === DOB);
+      expect(Buffer.from(dob![1]).toString('hex')).toBe('00000000');
       expect(warn.mock.calls.flat().join(' ')).toMatch(/no stored date of birth/);
       warn.mockRestore();
     });
@@ -777,6 +782,142 @@ describe('BeurerBf720Adapter', () => {
       const hits = warn.mock.calls.filter((c) => String(c[0]).includes('no stored user')).length;
       expect(hits).toBe(1);
       warn.mockRestore();
+    });
+  });
+
+  // -- #229 review follow-ups: things the first pass got wrong ---------------
+  describe('session hygiene and provisioning bounds (#229)', () => {
+    const UCP = uuid16(0x2a9f);
+    const FFF2 = uuid16(0xfff2);
+    const FFF3 = uuid16(0xfff3);
+    const DOB = uuid16(0x2a85);
+    const GENDER = uuid16(0x2a8c);
+    const HEIGHT = uuid16(0x2a8e);
+    const DBINC = uuid16(0x2a99);
+    const WEIGHT = uuid16(0x2a9d);
+    const BODYCOMP = uuid16(0x2a9c);
+
+    const ALL = new Set([WEIGHT, BODYCOMP, UCP, FFF2, FFF3, DOB, GENDER, HEIGHT, DBINC]);
+
+    const settle = async (): Promise<void> => {
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    };
+
+    function ctxWith(
+      stored: Record<string, Buffer>,
+      opts: { provision?: boolean; profile?: ConnectionContext['profile'] } = {},
+    ): ConnectionContext {
+      return {
+        profile: opts.profile ?? defaultProfile(),
+        deviceAddress: 'E7DB49F186DE',
+        availableChars: ALL,
+        scaleAuth: { pin: 3752, userIndex: 1, provision: opts.provision },
+        write: vi.fn().mockResolvedValue(undefined),
+        read: vi.fn(async (uuid: string) => stored[uuid] ?? Buffer.alloc(0)),
+        subscribe: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ConnectionContext;
+    }
+
+    // Erased flash reads back as 0xff. An unbounded floor accepted 0xffff as a
+    // birth year and as a 65535 cm height, so provisioning wrote it straight
+    // back and the scale kept the garbage.
+    it('treats an all-ff date of birth and height as unset and provisions them', async () => {
+      const a = makeAdapter();
+      const ctx = ctxWith(
+        {
+          [DOB]: Buffer.from('ffffffff', 'hex'),
+          [HEIGHT]: Buffer.from('ffff', 'hex'),
+          [GENDER]: Buffer.from('ff', 'hex'),
+          [FFF3]: Buffer.from('ff', 'hex'),
+        },
+        { provision: true },
+      );
+      await a.onConnected(ctx);
+      const write = ctx.write as ReturnType<typeof vi.fn>;
+      write.mockClear();
+      a.parseCharNotification(UCP, Buffer.from('200201', 'hex'));
+      await settle();
+      const writes = write.mock.calls.map((c) => [c[0] as string, c[1] as Buffer | number[]]);
+      expect(Buffer.from(writes.find((w) => w[0] === HEIGHT)![1]).toString('hex')).toBe('b700');
+      expect(Buffer.from(writes.find((w) => w[0] === DOB)![1]).toString('hex')).not.toBe(
+        'ffffffff',
+      );
+    });
+
+    // birth_date is a validated YYYY-MM-DD, so the scale should get the real
+    // anniversary rather than 1 January of the derived year.
+    it('provisions the real date of birth when the profile carries one', async () => {
+      const a = makeAdapter();
+      const ctx = ctxWith(
+        { [DOB]: Buffer.from('00000000', 'hex') },
+        { provision: true, profile: defaultProfile({ birthDate: '1990-06-15' }) },
+      );
+      await a.onConnected(ctx);
+      const write = ctx.write as ReturnType<typeof vi.fn>;
+      write.mockClear();
+      a.parseCharNotification(UCP, Buffer.from('200201', 'hex'));
+      await settle();
+      const dob = write.mock.calls.find((c) => c[0] === DOB);
+      // 1990 = 0x07C6, then month 6, day 15.
+      expect(Buffer.from(dob![1] as number[]).toString('hex')).toBe('c607060f');
+    });
+
+    it('does not claim the scale is empty once the consent was accepted', () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const a = makeAdapter();
+      a.parseCharNotification(UCP, Buffer.from('200201', 'hex'));
+      a.parseCharNotification(FFF2, Buffer.from('01', 'hex'));
+      expect(warn.mock.calls.flat().join(' ')).not.toMatch(/no stored user profiles/);
+      warn.mockRestore();
+    });
+
+    it('ignores a User Control Point response to a different opcode', async () => {
+      const a = makeAdapter();
+      const ctx = ctxWith({});
+      await a.onConnected(ctx);
+      const read = ctx.read as ReturnType<typeof vi.fn>;
+      read.mockClear();
+      a.parseCharNotification(UCP, Buffer.from('200101', 'hex'));
+      await settle();
+      expect(read).not.toHaveBeenCalled();
+    });
+
+    it('names an unsupported User Control Point result', () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const a = makeAdapter();
+      a.parseCharNotification(UCP, Buffer.from('200203', 'hex'));
+      expect(warn.mock.calls.flat().join(' ')).toMatch(/INVALID_PARAMETER/);
+      warn.mockRestore();
+    });
+
+    it('does not warn at session end when a reading was emitted', () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const a = makeAdapter();
+      a.parseCharNotification(WEIGHT, WSS_FRAME);
+      expect(a.parseCharNotification(BODYCOMP, BCS_FRAME)).not.toBeNull();
+      a.onSessionEnd!();
+      expect(warn.mock.calls.flat().join(' ')).not.toMatch(/no usable body-composition/);
+      warn.mockRestore();
+    });
+
+    it('warns at session end when a weight arrived but no composition did', () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const a = makeAdapter();
+      a.parseCharNotification(WEIGHT, WSS_FRAME);
+      a.onSessionEnd!();
+      expect(warn.mock.calls.flat().join(' ')).toMatch(/no usable body-composition/);
+      warn.mockRestore();
+    });
+
+    // Multi-char subscriptions are enabled before onConnected is awaited, so a
+    // frame from the next session must not inherit this session's cache.
+    it('clears the cached weight, timestamp and composition at session end', () => {
+      const a = makeAdapter();
+      a.parseCharNotification(WEIGHT, WSS_FRAME);
+      expect(a.parseCharNotification(BODYCOMP, BCS_FRAME)).not.toBeNull();
+      a.onSessionEnd!();
+      // A weight-only frame in the next session must not resolve on its own.
+      expect(a.parseCharNotification(BODYCOMP, BCS_FRAME)).toBeNull();
     });
   });
 });

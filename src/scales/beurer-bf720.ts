@@ -57,10 +57,19 @@ const PROFILE_FIELDS: ProfileField[] = [
   {
     uuid: CHR_DATE_OF_BIRTH,
     label: 'date of birth',
-    isSet: (v) => v.length >= 4 && v.readUInt16LE(0) >= 1900,
+    // Erased flash reads back as 0xff, so 0xffff must not pass as a year.
+    isSet: (v) => {
+      if (v.length < 4) return false;
+      const year = v.readUInt16LE(0);
+      return year >= 1900 && year <= new Date().getFullYear();
+    },
     fromProfile: (p) => {
-      // UserProfile carries an age, not a birth date, so anchor to 1 January
-      // the same way src/scales/renpho.ts does.
+      const born = p.birthDate ? new Date(p.birthDate) : null;
+      if (born && !Number.isNaN(born.getTime())) {
+        const y = born.getFullYear();
+        return [y & 0xff, (y >> 8) & 0xff, born.getMonth() + 1, born.getDate()];
+      }
+      // No birth date in the profile: anchor to 1 January of the derived year.
       const year = new Date().getFullYear() - Math.max(1, Math.round(p.age));
       return [year & 0xff, (year >> 8) & 0xff, 1, 1];
     },
@@ -69,13 +78,22 @@ const PROFILE_FIELDS: ProfileField[] = [
     uuid: CHR_GENDER,
     label: 'gender',
     // Male is 0x00, so "non zero" would read a valid male profile as unset.
+    // The cost is that a wiped scale returning 0x00 is indistinguishable from a
+    // real male profile and is therefore never provisioned. Accepted
+    // deliberately: silently rewriting a valid profile is the worse failure.
     isSet: (v) => v.length >= 1 && v[0] <= 2,
     fromProfile: (p) => [p.gender === 'female' ? 1 : 0],
   },
   {
     uuid: CHR_HEIGHT,
     label: 'height',
-    isSet: (v) => v.length >= 2 && v.readUInt16LE(0) > 0,
+    // Bounded for the same reason as the birth year: 0xffff is erased flash,
+    // not a 655 metre person.
+    isSet: (v) => {
+      if (v.length < 2) return false;
+      const cm = v.readUInt16LE(0);
+      return cm >= 50 && cm <= 250;
+    },
     fromProfile: (p) => {
       const cm = Math.max(1, Math.round(p.height));
       return [cm & 0xff, (cm >> 8) & 0xff];
@@ -199,6 +217,16 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
   private userListAnswered = false;
   /** Latch so the "no stored users" hint is printed at most once per session. */
   private emptyListReported = false;
+  /** Whether the scale accepted the consent code this session. */
+  private consentAccepted = false;
+  /** Whether a reading was emitted this session (gates the session-end warning). */
+  private readingEmitted = false;
+  /**
+   * Field labels already warned about, for the process lifetime. In continuous
+   * mode a scale with a legitimately empty field would otherwise print the same
+   * four lines on every cycle, forever.
+   */
+  private readonly warnedFields = new Set<string>();
   /**
    * Composition as it stood when each reading was emitted. Weak so buffered
    * history readings do not pin memory once the processor drops them.
@@ -302,6 +330,8 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     this.userSlotsSeen = 0;
     this.userListAnswered = false;
     this.emptyListReported = false;
+    this.consentAccepted = false;
+    this.readingEmitted = false;
 
     await ctx.write(CHR_CURRENT_TIME, this.buildCurrentTime(), true);
 
@@ -360,6 +390,10 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
           continue;
         }
         bleLog.debug(`Beurer BF720: stored ${field.label} = [${hex(stored)}]`);
+        // The write-back itself is unconditional, exactly as before this option
+        // existed. Provisioning changes the BYTES, never whether the field is
+        // committed: the scale waits for the full sequence, and dropping a write
+        // on an install that never opted in would be an undeclared change.
         if (stored.length > 0 && field.isSet(stored)) {
           values.set(field.uuid, stored);
         } else if (this.provision) {
@@ -371,11 +405,8 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
               `${this.userIndex}; writing the value from config.yaml [${hex(filled)}]`,
           );
         } else {
-          bleLog.warn(
-            `Beurer BF720: the scale has no stored ${field.label} for user ` +
-              `${this.userIndex}. Set \`users[].beurer_provision: true\` to write it ` +
-              'from config.yaml.',
-          );
+          values.set(field.uuid, stored);
+          this.warnUnsetFieldOnce(field.label);
         }
       }
       for (const [uuid, value] of values) {
@@ -411,9 +442,14 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
       return;
     }
     if (data[0] === 0x00) {
-      // Truncated record: ignore it, but never count it as "the list is empty".
-      if (data.length < 12) return;
+      // A truncated record still proves a slot exists; only its layout is
+      // unknown. Counting it is what stops the "no stored users" hint firing on
+      // a scale that plainly has one.
       this.userSlotsSeen += 1;
+      if (data.length < 12) {
+        bleLog.debug(`Beurer BF720: short user-slot record (${data.length}B), not decoded`);
+        return;
+      }
       const slot = data[1];
       const year = data.readUInt16LE(5);
       const height = data[9];
@@ -425,9 +461,22 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
       );
       return;
     }
+    // An unrecognised status byte still means the scale answered and named no
+    // slot. On its own that is weak evidence, which is why reportEmptyUserList
+    // also requires the consent to have been refused before it says anything.
     bleLog.debug(`Beurer BF720: user-list status 0x${data[0].toString(16).padStart(2, '0')}`);
     this.userListAnswered = true;
     this.reportEmptyUserList();
+  }
+
+  /** Warn once per process that a profile field came back empty. */
+  private warnUnsetFieldOnce(label: string): void {
+    if (this.warnedFields.has(label)) return;
+    this.warnedFields.add(label);
+    bleLog.warn(
+      `Beurer BF720: the scale has no stored ${label} for user ${this.userIndex}. ` +
+        'Set `users[].beurer_provision: true` to write it from config.yaml.',
+    );
   }
 
   /**
@@ -439,6 +488,9 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
    */
   private reportEmptyUserList(): void {
     if (this.emptyListReported || !this.userListAnswered || this.userSlotsSeen > 0) return;
+    // A scale that accepted the consent code is working. Telling that user to
+    // switch to beurer_pin 0 would break a setup that reads fine today.
+    if (this.consentAccepted) return;
     this.emptyListReported = true;
     bleLog.warn(
       'Beurer BF720: the scale reports no stored user profiles. Removing the batteries ' +
@@ -506,6 +558,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     const result = data[2];
     const name = UCP_RESULTS[result] ?? `0x${result.toString(16).padStart(2, '0')}`;
     if (result === UCP_RESULT_SUCCESS) {
+      this.consentAccepted = true;
       bleLog.debug('Beurer BF720: consent accepted, awaiting measurement');
       void this.syncUserProfile(this.session);
     } else if (result === UCP_RESULT_NOT_AUTHORIZED) {
@@ -531,14 +584,25 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
    * local, so an in-flight commit still finishes.
    */
   onSessionEnd(): void {
-    if (this.cachedWeight > 0 && this.cachedComp.fat == null) {
+    // Only when nothing was emitted at all. cachedComp is reset by every zeroed
+    // composition stub, so testing it alone would fire on a successful session
+    // that happened to end with a stub.
+    if (!this.readingEmitted && this.cachedWeight > 0) {
       bleLog.warn(
         `Beurer BF720: the session ended with a weight (${this.cachedWeight.toFixed(2)} kg) ` +
-          'but no body-composition values, so no reading was emitted. The scale sent only ' +
-          'zeroed composition frames. Please report this log on issue #229.',
+          'but no usable body-composition values, so no reading was emitted. Either no ' +
+          'composition frame arrived or every one of them was zeroed. Please report this ' +
+          'log on issue #229.',
       );
     }
+    // Clearing the cache here, not only in onConnected, matters: multi-char
+    // subscriptions are enabled before onConnected is awaited, so a frame from
+    // the next session could otherwise be parsed against this session's values
+    // and inherit its composition snapshot and timestamp.
     this.ctx = undefined;
+    this.cachedWeight = 0;
+    this.cachedTimestamp = undefined;
+    this.cachedComp = {};
   }
 
   /** Decode a 7-byte SIG timestamp; return undefined on a zero/invalid date. */
@@ -693,6 +757,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     // entry whatever happened to be cached at the END of the session. With a
     // snapshot each reading keeps the composition it was actually built from.
     this.compByReading.set(reading, { ...this.cachedComp });
+    this.readingEmitted = true;
     return reading;
   }
 

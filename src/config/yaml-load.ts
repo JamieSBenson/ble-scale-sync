@@ -29,7 +29,7 @@ export function loadYamlConfig(configPath?: string): AppConfig {
   // config fails to parse for an unrelated reason (#318).
   for (const key of collectUnknownKeys(resolved)) {
     log.warn(
-      `Unknown config key '${key}' in config.yaml. It is ignored. If you copied it from ` +
+      `Unknown config key '${key}' in ${yamlPath}. It is ignored. If you copied it from ` +
         'the documentation, this build is older than that key: update the app.',
     );
   }

@@ -71,6 +71,24 @@ if (cliFlags.help) {
 
 const log = createLogger('Sync');
 
+/**
+ * One line naming exactly which build is running.
+ *
+ * #318 was diagnosed only after separating "this option does nothing" from
+ * "this container predates the option", and nothing in the log distinguished
+ * them. APP_BUILD_* are set by the image build; on a bare checkout they are
+ * absent and only the package version is printed.
+ *
+ * Emitted here rather than inside main() on purpose: loadAppConfig below can
+ * throw, and the failures that most need this line never reach main().
+ */
+const buildChannel = process.env.APP_BUILD_CHANNEL;
+const buildRef = process.env.APP_BUILD_REF;
+log.info(
+  `Version ${pkg.version}` +
+    (buildChannel ? ` (image ${buildChannel}${buildRef ? ` @ ${buildRef.slice(0, 7)}` : ''})` : ''),
+);
+
 const loaded = loadAppConfig(cliFlags.config as string | undefined);
 const initialConfig = loaded.config;
 const initialResolved = resolveRuntimeConfig(initialConfig);
@@ -259,16 +277,6 @@ async function main(): Promise<void> {
         'If auto-detection picked the wrong adapter, please report it so the matcher can be fixed.',
     );
   }
-  // Build identity. #318 was diagnosed only after ruling out "the option does
-  // nothing" against "the container predates the option", and nothing in the log
-  // separated those. APP_BUILD_* are set by the image build; on a bare checkout
-  // they are absent and only the package version is printed.
-  const buildChannel = process.env.APP_BUILD_CHANNEL;
-  const buildRef = process.env.APP_BUILD_REF;
-  const buildSuffix = buildChannel
-    ? ` (image ${buildChannel}${buildRef ? ` @ ${buildRef.slice(0, 7)}` : ''})`
-    : '';
-  log.info(`Version ${pkg.version}${buildSuffix}`);
   log.info(`Adapters: ${adapters.map((a) => a.name).join(', ')}\n`);
 
   // Inject runtime config into adapters that read it: the Xiaomi S800 MiBeacon
