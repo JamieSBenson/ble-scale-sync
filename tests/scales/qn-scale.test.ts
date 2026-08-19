@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { jieliAuthResponseFrame } from '../../src/scales/jieli-auth.js';
 import { QnScaleAdapter } from '../../src/scales/qn-scale.js';
 import { bleLog } from '../../src/ble/types.js';
 import type { BleDeviceInfo, ConnectionContext } from '../../src/interfaces/scale-adapter.js';
@@ -964,8 +965,35 @@ describe('QnScaleAdapter', () => {
 
 describe('AE02 dispatch (#75, #235)', () => {
   const AE02 = '0000ae0200001000800000805f9b34fb';
+  const AE01 = '0000ae0100001000800000805f9b34fb';
   // Real AE00 challenge from the Arboleaf capture in #75.
   const challenge = Buffer.from('00664d6b485e50d84a9eb9405f9ef787f3', 'hex');
+
+  /** Connect an adapter and capture every AE01 write. */
+  async function connectCapturingAe01(
+    adapter: QnScaleAdapter,
+  ): Promise<{ writes: Buffer[]; flush: () => Promise<void> }> {
+    const writes: Buffer[] = [];
+    const ctx = {
+      write: async (uuid: string, data: Buffer | number[]) => {
+        if (uuid === AE01) writes.push(Buffer.from(data as number[]));
+      },
+      read: async () => Buffer.alloc(0),
+      subscribe: async () => {},
+      profile: defaultProfile,
+      deviceAddress: '',
+      availableChars: new Set<string>([AE01, AE02]),
+    } as unknown as ConnectionContext;
+    await adapter.onConnected(ctx);
+    writes.length = 0; // drop the handshake init frame; only challenge traffic matters here
+    return {
+      writes,
+      flush: async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      },
+    };
+  }
 
   it('swallows the AE00 challenge instead of parsing it as a vendor frame', () => {
     const adapter = makeAdapter();
@@ -973,9 +1001,9 @@ describe('AE02 dispatch (#75, #235)', () => {
 
     expect(adapter.parseCharNotification(AE02, challenge)).toBeNull();
 
-    const logged = debugSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    const logged = debugSpy.mock.calls.map((c) => String(c[0])).join(' | ');
     expect(logged).toContain('QN AE02 (17B)');
-    expect(logged).toContain('AE00 challenge frame received');
+    expect(logged).toContain('AE00 challenge received');
     debugSpy.mockRestore();
   });
 
@@ -988,9 +1016,45 @@ describe('AE02 dispatch (#75, #235)', () => {
 
     const hits = debugSpy.mock.calls
       .map((c) => String(c[0]))
-      .filter((m) => m.includes('AE00 challenge frame received'));
+      .filter((m) => m.includes('AE00 challenge received'));
     expect(hits).toHaveLength(1);
     debugSpy.mockRestore();
+  });
+
+  // The gate itself: without this write the scale never sends a 0x10 frame.
+  // The expected bytes are the JieLi RcspAuth response for this exact
+  // challenge, computed by src/scales/jieli-auth.ts (verified in #235 against
+  // ten captured pairs).
+  it('answers the challenge on AE01 with the JieLi response frame', async () => {
+    const adapter = makeAdapter();
+    vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+    const { writes, flush } = await connectCapturingAe01(adapter);
+
+    adapter.parseCharNotification(AE02, challenge);
+    await flush();
+
+    expect(writes).toHaveLength(1);
+    const expected = jieliAuthResponseFrame(challenge);
+    expect(writes[0].toString('hex')).toBe(expected.toString('hex'));
+    expect(writes[0][0]).toBe(0x01);
+    expect(writes[0]).toHaveLength(17);
+    vi.restoreAllMocks();
+  });
+
+  it('stops answering (and warns) when the scale keeps re-challenging', async () => {
+    const adapter = makeAdapter();
+    vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+    const { writes, flush } = await connectCapturingAe01(adapter);
+
+    for (let i = 0; i < 6; i++) {
+      adapter.parseCharNotification(AE02, challenge);
+      await flush();
+    }
+
+    expect(writes).toHaveLength(3);
+    expect(warnSpy.mock.calls.map((c) => String(c[0])).join(' | ')).toContain('re-issued the AE00');
+    vi.restoreAllMocks();
   });
 
   it('still parses a real weight frame arriving on the notify characteristic', () => {
@@ -1016,5 +1080,201 @@ describe('AE02 dispatch (#75, #235)', () => {
     // Falls through and is rejected by the vendor parser, not by the AE02 gate.
     expect(adapter.parseCharNotification(AE02, notChallenge)).toBeNull();
     vi.restoreAllMocks();
+  });
+
+  describe('onSessionEnd (#235)', () => {
+    it('clears the fallback timer so it cannot fire against a dead session', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = makeAdapter();
+        const writes: number[][] = [];
+        const ctx = {
+          write: async (_uuid: string, data: Buffer | number[]) => {
+            writes.push([...data]);
+          },
+          read: async () => Buffer.alloc(0),
+          subscribe: async () => {},
+          profile: defaultProfile(),
+          deviceAddress: '',
+          availableChars: new Set<string>(),
+        } as unknown as ConnectionContext;
+        await adapter.onConnected(ctx);
+        writes.length = 0;
+        adapter.onSessionEnd!();
+        // The 2s fallback handshake must not run after the session ended.
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(writes).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  // ── GE CS 10 G "Fit Plus" extended long frame (#235) ────────────────────────
+  describe('GE CS 10 G extended long frame (#235)', () => {
+    /** Real 20-byte 0x12 from a GE CS 10 G "Fit Plus" (#235). */
+    function makeExtendedScaleInfo(): Buffer {
+      return Buffer.from([
+        0x12, 0x14, 0xff, 0x4e, 0xc7, 0x0e, 0x00, 0x07, 0xff, 0x14, 0x0f, 0x42, 0x00, 0x08, 0x05,
+        0x03, 0xe0, 0x6f, 0x2b, 0x3d,
+      ]);
+    }
+
+    /** Real 18-byte 0x12 from a Renpho ES-26M (45e4d6e). */
+    function makeEs26mScaleInfo(): Buffer {
+      return Buffer.from([
+        0x12, 0x12, 0xff, 0x0f, 0xac, 0x14, 0x00, 0x04, 0xff, 0x0f, 0x07, 0x0a, 0x00, 0x00, 0x05,
+        0x9f, 0x30, 0xe9,
+      ]);
+    }
+
+    /**
+     * Drive the handshake from a 0x12 scale-info frame all the way to the 0x22
+     * START, collecting every write. The 0x14 and 0x21 frames are the ones the
+     * GE CS 10 G actually sends (#235).
+     */
+    async function driveHandshake(adapter: QnScaleAdapter, info: Buffer): Promise<number[][]> {
+      vi.useFakeTimers();
+      try {
+        const writes: number[][] = [];
+        const ctx = {
+          write: async (_uuid: string, data: Buffer | number[]) => {
+            writes.push([...data]);
+          },
+          read: async () => Buffer.alloc(0),
+          subscribe: async () => {},
+          profile: defaultProfile(),
+          deviceAddress: '',
+          availableChars: new Set<string>(),
+        } as unknown as ConnectionContext;
+        await adapter.onConnected(ctx);
+        adapter.parseNotification(info);
+        adapter.parseNotification(
+          Buffer.from([0x14, 0x0c, 0xff, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xfd, 0x1f]),
+        );
+        adapter.parseNotification(Buffer.from([0x21, 0x07, 0xff, 0x01, 0x61, 0x2c, 0xb5]));
+        await vi.advanceTimersByTimeAsync(2000);
+        return writes;
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    it('20B 0x12 frame echoes the protocol type into the 0x13 config', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeExtendedScaleInfo());
+      const config = writes.find((w) => w[0] === 0x13 && w[4] === 0x10);
+      expect(config).toEqual([0x13, 0x09, 0xff, 0x01, 0x10, 0x00, 0x00, 0x00, 0x2c]);
+    });
+
+    it('20B 0x12 frame makes the 0x22 START byte identical to the vendor app', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeExtendedScaleInfo());
+      const start = writes.find((w) => w[0] === 0x22);
+      expect(start).toEqual([0x22, 0x06, 0xff, 0x00, 0x03, 0x2a]);
+    });
+
+    it('20B 0x12 frame echoes the protocol type into the 0x20 time sync', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeExtendedScaleInfo());
+      const timeSync = writes.find((w) => w[0] === 0x20);
+      expect(timeSync).toBeDefined();
+      expect(timeSync![2]).toBe(0xff);
+      // The four time bytes are wall-clock dependent; the checksum is not.
+      expect(timeSync![7]).toBe(timeSync!.slice(0, 7).reduce((a, b) => a + b, 0) & 0xff);
+    });
+
+    // Hardware regression guard for 45e4d6e: on the 18-byte ES-26M frame,
+    // echoing data[2] made the scale reject every command. It must stay 0x00.
+    it('18B 0x12 frame still sends proto 0x00 (ES-26M hardware guard)', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeEs26mScaleInfo());
+      const config = writes.find((w) => w[0] === 0x13 && w[4] === 0x10);
+      expect(config).toEqual([0x13, 0x09, 0x00, 0x01, 0x10, 0x00, 0x00, 0x00, 0x2d]);
+      const start = writes.find((w) => w[0] === 0x22);
+      expect(start).toEqual([0x22, 0x06, 0x00, 0x00, 0x03, 0x2b]);
+    });
+
+    it('classic 11B 0x12 frame is unaffected by the extended-dialect rule', async () => {
+      const adapter = makeAdapter();
+      const info = Buffer.alloc(11);
+      info[0] = 0x12;
+      info[2] = 0xab;
+      info[10] = 1;
+      const writes = await driveHandshake(adapter, info);
+      const config = writes.find((w) => w[0] === 0x13 && w[4] === 0x10);
+      expect(config).toBeDefined();
+      expect(config![2]).toBe(0xab);
+    });
+
+    // #235: after START the GE CS 10 G stays silent until the vendor app writes
+    // this frame twice. hedoric's retest on the proto fix proved every other
+    // command already matches the app byte for byte.
+    it('sends the measurement trigger twice after START on the extended dialect', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeExtendedScaleInfo());
+      const startIndex = writes.findIndex((w) => w[0] === 0x22);
+      expect(startIndex).toBeGreaterThanOrEqual(0);
+      const after = writes.slice(startIndex + 1);
+      const triggers = after.filter((w) => w[0] === 0xa2);
+      expect(triggers).toHaveLength(2);
+      for (const t of triggers) {
+        expect(t).toEqual([0xa2, 0x06, 0x01, 0x1e, 0x23, 0xea]);
+        // Self-consistent QN frame: checksum is the low byte of the sum.
+        expect(t[5]).toBe(t.slice(0, 5).reduce((a, b) => a + b, 0) & 0xff);
+      }
+    });
+
+    it('does not send the trigger on the ES-26M dialect', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeEs26mScaleInfo());
+      const startIndex = writes.findIndex((w) => w[0] === 0x22);
+      expect(startIndex).toBeGreaterThanOrEqual(0);
+      expect(writes.slice(startIndex + 1).filter((w) => w[0] === 0xa2)).toHaveLength(0);
+    });
+
+    it('does not send the trigger on the classic dialect', async () => {
+      const adapter = makeAdapter();
+      const info = Buffer.alloc(11);
+      info[0] = 0x12;
+      info[2] = 0xab;
+      info[10] = 1;
+      const writes = await driveHandshake(adapter, info);
+      const startIndex = writes.findIndex((w) => w[0] === 0x22);
+      expect(startIndex).toBeGreaterThanOrEqual(0);
+      expect(writes.slice(startIndex + 1).filter((w) => w[0] === 0xa2)).toHaveLength(0);
+    });
+
+    // The trigger is a different frame from the A2 user profile sent at ready
+    // time, so the profile must still go out exactly once, before START.
+    it('keeps the ready-time A2 user profile distinct from the trigger', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeExtendedScaleInfo());
+      const startIndex = writes.findIndex((w) => w[0] === 0x22);
+      const beforeStart = writes.slice(0, startIndex).filter((w) => w[0] === 0xa2);
+      expect(beforeStart).toHaveLength(1);
+      expect(beforeStart[0][3]).toBe(0x32);
+      expect(beforeStart[0][4]).toBe(30); // defaultProfile age
+    });
+
+    it('keeps the long-frame impedance grace path on the extended dialect', () => {
+      const adapter = makeAdapter();
+      adapter.parseNotification(makeExtendedScaleInfo());
+      const stableNoImpedance = Buffer.alloc(14);
+      stableNoImpedance[0] = 0x10;
+      stableNoImpedance[1] = 0x0e;
+      stableNoImpedance[2] = 0xff;
+      stableNoImpedance[3] = 0x01;
+      stableNoImpedance[4] = 0x02;
+      stableNoImpedance.writeUInt16BE(9790, 5);
+      // First stable R1=R2=0 frame only starts the grace timer.
+      expect(adapter.parseNotification(stableNoImpedance)).toBeNull();
+      (adapter as unknown as { firstStableNoImpedanceAt: number }).firstStableNoImpedanceAt =
+        Date.now() - 2000;
+      const reading = adapter.parseNotification(stableNoImpedance);
+      expect(reading).not.toBeNull();
+      expect(reading!.weight).toBeCloseTo(97.9);
+      expect(reading!.impedance).toBe(0);
+    });
   });
 });

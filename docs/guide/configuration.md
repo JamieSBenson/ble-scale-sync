@@ -57,17 +57,58 @@ ble:
   # handler: auto
   # noble_driver: abandonware
   # adapter: hci1
+  # force_scale_adapter: 'Hutbit'
+  # session_timeout_sec: 20
 ```
 
-| Field           | Required                    | Default        | Description                                                                                                                                                                                          |
-| --------------- | --------------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `scale_mac`     | Recommended                 | Auto-discovery | MAC address, or a CoreBluetooth UUID on macOS (bare 32-hex as the wizard writes it, or the dashed form). Prevents connecting to a neighbor's scale.                                                  |
-| `bind_key`      | Xiaomi S800 only            | (none)         | 32-char hex per-device MiBeacon key from the Mi cloud (extract with the community Xiaomi-cloud-tokens-extractor). Decrypts only the device's own FE95 broadcast. Keep it secret; it is a credential. |
-| `handler`       | No                          | `auto`         | Transport: `auto` (local radio), `mqtt-proxy` (ESP32 over MQTT), `esphome-proxy` (ESPHome Native API). See below.                                                                                    |
-| `noble_driver`  | No                          | OS default     | `abandonware` or `stoprocent`. Overrides the default BLE driver. Only applies when `handler: auto`.                                                                                                  |
-| `adapter`       | No                          | System default | Linux only. Select a specific Bluetooth adapter (e.g., `hci0`, `hci1`). See below.                                                                                                                   |
-| `mqtt_proxy`    | If `handler: mqtt-proxy`    | (none)         | MQTT proxy connection (`broker_url`, `device_id`, `topic_prefix`, `username`, `password`, `auto_connect`, `embedded_broker_*`). See [ESP32 BLE Proxy](./esp32-proxy).                                |
-| `esphome_proxy` | If `handler: esphome-proxy` | (none)         | ESPHome Native API connection (`host`, `port`, `encryption_key` or `password`, `client_info`). See [ESPHome Bluetooth Proxy](./esphome-proxy).                                                       |
+| Field                 | Required                    | Default        | Description                                                                                                                                                                                          |
+| --------------------- | --------------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scale_mac`           | Recommended                 | Auto-discovery | MAC address, or a CoreBluetooth UUID on macOS (bare 32-hex as the wizard writes it, or the dashed form). Prevents connecting to a neighbor's scale.                                                  |
+| `bind_key`            | Xiaomi S800 only            | (none)         | 32-char hex per-device MiBeacon key from the Mi cloud (extract with the community Xiaomi-cloud-tokens-extractor). Decrypts only the device's own FE95 broadcast. Keep it secret; it is a credential. |
+| `handler`             | No                          | `auto`         | Transport: `auto` (local radio), `mqtt-proxy` (ESP32 over MQTT), `esphome-proxy` (ESPHome Native API). See below.                                                                                    |
+| `noble_driver`        | No                          | OS default     | `abandonware` or `stoprocent`. Overrides the default BLE driver. Only applies when `handler: auto`.                                                                                                  |
+| `adapter`             | No                          | System default | Linux only. Select a specific Bluetooth adapter (e.g., `hci0`, `hci1`). See below.                                                                                                                   |
+| `force_scale_adapter` | No                          | Auto-detect    | Name of the scale protocol adapter to use, bypassing auto-detection. Requires `scale_mac`. See below.                                                                                                |
+| `session_timeout_sec` | No                          | `120`          | Seconds one GATT session may wait for a complete reading (5 to 600). Native BLE handlers only; ignored on `mqtt-proxy` and `esphome-proxy`. See below.                                               |
+| `mqtt_proxy`          | If `handler: mqtt-proxy`    | (none)         | MQTT proxy connection (`broker_url`, `device_id`, `topic_prefix`, `username`, `password`, `auto_connect`, `embedded_broker_*`). See [ESP32 BLE Proxy](./esp32-proxy).                                |
+| `esphome_proxy`       | If `handler: esphome-proxy` | (none)         | ESPHome Native API connection (`host`, `port`, `encryption_key` or `password`, `client_info`). See [ESPHome Bluetooth Proxy](./esphome-proxy).                                                       |
+
+::: warning Forcing a scale adapter
+`force_scale_adapter` is an escape hatch for when auto-detection routes your scale to the wrong protocol adapter, which happens with rebadged OEM hardware that shares a vendor service with another brand.
+
+Use the adapter name exactly as it appears in the `Adapters:` line printed at startup:
+
+```yaml
+ble:
+  scale_mac: '03:B3:EC:91:A2:12'
+  force_scale_adapter: 'Hutbit'
+```
+
+Two things to know. The forced adapter claims **every** device it is shown, which is why `scale_mac` is required: the MAC is what keeps it aimed at your scale. And an unknown name fails at startup with the list of valid ones rather than being ignored.
+
+If you need this, please [open an issue](https://github.com/KristianP26/ble-scale-sync/issues) with your scale's advertisement, so detection can be fixed for everyone and you can drop the override.
+:::
+
+::: tip Shortening the session (`session_timeout_sec`)
+Some scales will not run a standalone weigh-in while a host holds the GATT session open. The Beurer BF500 is the clearest example: it displays `APP` and waits, so only a measurement taken **between** sessions is picked up.
+
+By default a session waits 120 seconds for a reading. On a scale like this, that is 120 seconds out of every cycle in which stepping on it achieves nothing. Shortening the session, and lengthening the gap after it, frees the scale for most of the cycle:
+
+```yaml
+ble:
+  session_timeout_sec: 20
+runtime:
+  scan_cooldown: 60
+  watchdog_max_consecutive_failures: 0
+```
+
+Two costs, both real:
+
+- **More Bluetooth adapter resets.** Every read that ends in a timeout triggers one, and shorter sessions mean more timeouts per hour. On a Raspberry Pi that is noticeable.
+- **The failure watchdog trips sooner.** A session that times out counts as a failed cycle, so shorter sessions reach `watchdog_max_consecutive_failures` (default 10) in proportionally less time, and the process exits for the supervisor to restart. On a scale where waiting between weigh-ins is normal, raise that limit or set it to `0` to disable it, as above.
+
+This option applies to the native BLE handlers only. On `mqtt-proxy` and `esphome-proxy` the watcher waits for a weigh-in indefinitely by design, and the value is ignored.
+:::
 
 ::: tip BLE adapter selection (Linux only)
 If your device has multiple Bluetooth adapters, you can choose which one BLE Scale Sync uses. By default, the first adapter (`hci0`) is used.
@@ -129,6 +170,9 @@ users:
 | `weight_range`      | No       | (none)         | `{ min, max }` in kg. Required for [multi-user](/multi-user) deployments |
 | `last_known_weight` | No       | `null`         | Auto-updated after each measurement                                      |
 | `exporters`         | No       | (none)         | [Per-user exporter](/multi-user#per-user-exporters) overrides            |
+| `beurer_pin`        | Beurer   | (none)         | Consent code the Beurer BF7xx / BF9xx scale was paired with              |
+| `beurer_user_index` | No       | `1`            | Scale user slot the consent code belongs to                             |
+| `beurer_provision`  | No       | `false`        | Write this profile into a Beurer scale that has no stored user           |
 
 ### Exporters
 

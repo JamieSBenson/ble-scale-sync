@@ -7,6 +7,8 @@ import type {
   BleDeviceInfo,
 } from '../../src/interfaces/scale-adapter.js';
 import type { MqttProxyConfig } from '../../src/config/schema.js';
+import { adapters as realAdapters } from '../../src/scales/index.js';
+import { bleLog } from '../../src/ble/types.js';
 
 // Suppress log output during tests
 vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -2001,6 +2003,115 @@ describe('handler-mqtt-proxy', () => {
 
       const raw = await watcher.nextReading();
       expect(raw.reading.weight).toBe(75.0);
+    });
+
+    // #317: before this, the autonomous path resolved against a device with no
+    // name at all, so both Renpho adapters (each matching only by exact name)
+    // missed and selection fell through to a priority-ordered notify-char scan.
+    // R-MSC04 and ES-26BB both claim notify 0x2A10, R-MSC04 has the higher
+    // priority, and it then subscribes 0x2A12, which this scale does not expose.
+    it('autonomous connect resolves by the cached advertisement name (#317)', async () => {
+      const infoSpy = vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+      const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [...realAdapters], undefined, PROFILE);
+      await watcher.start();
+
+      // The scan result the ESP32 publishes before it connects carries the name.
+      mockClient._simulateMessage(
+        `${PREFIX}/scan/results`,
+        JSON.stringify([
+          { address: 'CF:E8:79:20:24:CC', name: 'ES-26BB-B', rssi: -60, services: [] },
+        ]),
+      );
+
+      // The reporter's exact characteristic list: 2a10 and 2a11 present, no 2a12.
+      const chars = [
+        '00002a1100001000800000805f9b34fb',
+        '00002a1000001000800000805f9b34fb',
+        '00002a0500001000800000805f9b34fb',
+        '00002a0000001000800000805f9b34fb',
+        '00002a1900001000800000805f9b34fb',
+        '00002a2400001000800000805f9b34fb',
+        '00002a2900001000800000805f9b34fb',
+        '00002a2800001000800000805f9b34fb',
+        '00002a2700001000800000805f9b34fb',
+        '00002a2500001000800000805f9b34fb',
+        '00002a2a00001000800000805f9b34fb',
+        '00002a2300001000800000805f9b34fb',
+        '00002a2600001000800000805f9b34fb',
+        '00002a5000001000800000805f9b34fb',
+        'f000ffc104514000b000000000000000',
+        'f000ffc204514000b000000000000000',
+      ].map((uuid) => ({ uuid, properties: ['notify', 'write'] }));
+
+      mockClient._simulateMessage(
+        `${PREFIX}/connected`,
+        JSON.stringify({ autonomous: true, address: 'CF:E8:79:20:24:CC', chars }),
+      );
+      await new Promise((r) => setTimeout(r, 50));
+
+      const lines = infoSpy.mock.calls.map((c) => String(c[0]));
+      expect(
+        lines.some((l) => l.includes('Autonomous GATT connect from ESP32: Renpho ES-26BB')),
+      ).toBe(true);
+      expect(lines.some((l) => l.includes('Renpho R-MSC04'))).toBe(false);
+      infoSpy.mockRestore();
+      await watcher.stop();
+    });
+
+    // #319: the host-initiated path used the advertisement-time adapter for the
+    // whole session. A Eufy A1 (fff1 + fff4, no fff2) advertises a bare fff0
+    // vendor service, which resolves to a fff1/fff2 adapter, and the read then
+    // failed on the missing write characteristic before a single notification.
+    it('host-initiated GATT re-resolves the adapter after discovery (#319)', async () => {
+      const infoSpy = vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+      const watcher = new ReadingWatcher(
+        { ...MQTT_PROXY_CONFIG, auto_connect: false },
+        [...realAdapters],
+        undefined,
+        PROFILE,
+      );
+      await watcher.start();
+
+      const origPublish = mockClient.publishAsync;
+      mockClient.publishAsync = vi.fn(async (topic: string, payload?: string | Buffer) => {
+        if (topic === `${PREFIX}/connect`) {
+          queueMicrotask(() =>
+            mockClient._simulateMessage(
+              `${PREFIX}/connected`,
+              JSON.stringify({
+                address: 'BC:0F:B7:18:70:28',
+                chars: [
+                  { uuid: '0000fff100001000800000805f9b34fb', properties: ['notify'] },
+                  { uuid: '0000fff400001000800000805f9b34fb', properties: ['notify', 'write'] },
+                ],
+              }),
+            ),
+          );
+        }
+        return origPublish(topic, payload);
+      });
+
+      // Nameless advert carrying only the bare fff0 vendor service.
+      mockClient._simulateMessage(
+        `${PREFIX}/scan/results`,
+        JSON.stringify([
+          {
+            address: 'BC:0F:B7:18:70:28',
+            name: 'eufy T9120',
+            rssi: -55,
+            services: ['0000fff000001000800000805f9b34fb'],
+          },
+        ]),
+      );
+      await new Promise((r) => setTimeout(r, 80));
+
+      const lines = infoSpy.mock.calls.map((c) => String(c[0]));
+      const reresolved = lines.find((l) => l.includes('Re-resolved adapter after GATT discovery'));
+      expect(reresolved).toBeDefined();
+      expect(reresolved).toContain('1byone (Eufy)');
+      infoSpy.mockRestore();
+      mockClient.publishAsync = origPublish;
+      await watcher.stop();
     });
 
     it('host-initiated connect ignores autonomous connected payload', async () => {

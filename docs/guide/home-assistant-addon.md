@@ -148,6 +148,36 @@ The add-on copies that file verbatim into the runtime location on each start. Se
 
 Custom config mode still benefits from `last_known_weight` persistence (see below) but the add-on does not auto-run Garmin authentication; you handle that yourself by pre-seeding `/share/ble-scale-sync/garmin-tokens/`.
 
+## Testing a development build
+
+Fixes land on the `dev` branch before they are released, and maintainers often ask reporters to retest there. What that means for the add-on is not obvious, so it is spelled out here.
+
+The Supervisor accepts a branch in the repository URL:
+
+```
+https://github.com/KristianP26/ble-scale-sync#dev
+```
+
+::: warning That gives you the dev add-on wrapper, not dev application code
+The add-on is a thin layer over a published application image, and `build.yaml` pins that image to the last **release** on both branches. So a `#dev` install gives you the dev branch's options UI and `run.sh`, running the released application underneath.
+
+This is exactly the trap in [#318](https://github.com/KristianP26/ble-scale-sync/issues/318): a new option appeared in the UI, was set, and did nothing, because the application inside the container predated it.
+:::
+
+To actually run unreleased application code today, run the plain Docker image outside the Supervisor:
+
+```
+ghcr.io/kristianp26/ble-scale-sync:dev
+```
+
+Every push to `dev` publishes that tag, plus an immutable `dev-<sha>` tag if you need two machines on provably the same build. See [Docker deployment](/guide/getting-started#docker) for the flags. You lose Supervisor integration and MQTT auto-detection; you gain the code under test.
+
+When reporting back, paste the `Version` line from the top of the log. On an image build it names the channel and the commit:
+
+```
+[Sync] Version 1.22.1 (image dev @ 9c67525)
+```
+
 ## Persistence
 
 Everything that should survive add-on restarts lives under `/data/` inside the container, which the Supervisor maps to persistent storage:

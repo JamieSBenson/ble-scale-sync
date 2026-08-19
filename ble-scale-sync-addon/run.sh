@@ -44,6 +44,7 @@ else
   # ── Read all options ────────────────────────────────────────────────────
 
   SCALE_MAC=$(opt scale_mac)
+  FORCE_SCALE_ADAPTER=$(opt force_scale_adapter)
 
   WEIGHT_UNIT=$(opt weight_unit)
   HEIGHT_UNIT=$(opt height_unit)
@@ -127,11 +128,19 @@ YAML
     fi
   fi
 
-  # BLE section (only if scale_mac or adapter is set)
-  if [ -n "$SCALE_MAC" ] || [ -n "$BLE_ADAPTER" ]; then
+  # force_scale_adapter matches every device it is shown, so it is only safe with
+  # a target MAC. Drop it rather than generate a config the app refuses to load.
+  if [ -n "$FORCE_SCALE_ADAPTER" ] && [ -z "$SCALE_MAC" ]; then
+    echo "[ble-scale-sync] WARNING: force_scale_adapter needs scale_mac; ignoring it"
+    FORCE_SCALE_ADAPTER=""
+  fi
+
+  # BLE section (only if scale_mac, adapter or a forced scale adapter is set)
+  if [ -n "$SCALE_MAC" ] || [ -n "$BLE_ADAPTER" ] || [ -n "$FORCE_SCALE_ADAPTER" ]; then
     echo "ble:" >> "$FRESH"
     [ -n "$SCALE_MAC" ] && echo "  scale_mac: \"$(yaml_escape "$SCALE_MAC")\"" >> "$FRESH"
     [ -n "$BLE_ADAPTER" ] && echo "  adapter: \"$(yaml_escape "$BLE_ADAPTER")\"" >> "$FRESH"
+    [ -n "$FORCE_SCALE_ADAPTER" ] && echo "  force_scale_adapter: \"$(yaml_escape "$FORCE_SCALE_ADAPTER")\"" >> "$FRESH"
     echo "" >> "$FRESH"
   fi
 

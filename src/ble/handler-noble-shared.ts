@@ -464,6 +464,7 @@ export function createNobleHandler({ noble, getState }: NobleHandlerDeps) {
     }
 
     const { targetMac, adapters, profile, scaleAuth, weightUnit, onLiveData, abortSignal } = opts;
+    const { readingTimeoutMs } = opts;
 
     try {
       await waitForPoweredOn();
@@ -608,7 +609,7 @@ export function createNobleHandler({ noble, getState }: NobleHandlerDeps) {
             onLiveData,
             scaleAuth,
           ),
-          RAW_READING_TIMEOUT_MS,
+          readingTimeoutMs ?? RAW_READING_TIMEOUT_MS,
           'Timed out waiting for a complete scale reading',
         );
 

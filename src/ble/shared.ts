@@ -36,8 +36,24 @@ import { HistoryBuffer, HoldTimer } from './notification-processor.js';
  * per-advertisement stream GATT-connects such devices instead (QN Elis 1).
  */
 export function hasParseableBroadcastSource(adapter: ScaleAdapter, info: BleDeviceInfo): boolean {
-  if (adapter.parseBroadcast && info.manufacturerData) return true;
-  if (adapter.parseServiceData && info.serviceData && info.serviceData.length > 0) return true;
+  // A forced adapter (ble.force_scale_adapter) is exempt from the "any
+  // manufacturer data counts" shortcut above, because the shortcut assumes the
+  // adapter was chosen BY that advertisement. A forced one was not: it claims
+  // every device it is shown, so a dual-mode adapter like QN or Eufy P2 pointed
+  // at a scale whose manufacturer data it cannot parse would return "wait"
+  // forever and the GATT path would never run. Here the parse must actually
+  // succeed.
+  const forced = adapter.isForcedOverride === true;
+  if (adapter.parseBroadcast && info.manufacturerData) {
+    if (!forced) return true;
+    if (adapter.parseBroadcast(info.manufacturerData.data) !== null) return true;
+  }
+  if (adapter.parseServiceData && info.serviceData && info.serviceData.length > 0) {
+    if (!forced) return true;
+    if (info.serviceData.some((sd) => adapter.parseServiceData!(sd.uuid, sd.data) !== null)) {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -125,15 +141,24 @@ export function findMissingCharacteristics(
   return missing;
 }
 
+/** ` for adapter "X"`, or nothing when the adapter is unknown. */
+function adapterSuffix(adapterName?: string): string {
+  return adapterName ? ` for adapter "${adapterName}"` : '';
+}
+
 /** Subscribe to a GATT characteristic and forward notifications to the handler.
  *  Returns the unsubscribe function from the BleChar. */
 async function subscribeToChar(
   charMap: Map<string, BleChar>,
   charUuid: string,
   onNotification: (sourceUuid: string, data: Buffer) => void,
+  adapterName?: string,
 ): Promise<() => void> {
   const char = resolveChar(charMap, charUuid);
-  if (!char) throw new Error(`Characteristic ${charUuid} not found`);
+  // Name the adapter: this almost always means the wrong adapter was selected
+  // for the device, and without the name the log gives no way to see that
+  // (#317, #319).
+  if (!char) throw new Error(`Characteristic ${charUuid} not found${adapterSuffix(adapterName)}`);
   const normalized = normalizeUuid(charUuid);
   return char.subscribe((data: Buffer) => onNotification(normalized, data));
 }
@@ -160,6 +185,7 @@ function initializeAdapter(
   let unlockInterval: ReturnType<typeof setInterval> | null = null;
   let resendUnlock: (() => Promise<void>) | null = null;
 
+  let sessionEnded = false;
   const cleanup = (): void => {
     if (unlockInterval) {
       clearInterval(unlockInterval);
@@ -167,6 +193,18 @@ function initializeAdapter(
     }
     for (const unsub of unsubscribers) unsub();
     unsubscribers.length = 0;
+    // Tell the adapter its session is over. Adapters are shared singletons, so
+    // without this they cannot distinguish "not connected yet" from "the
+    // previous connection" and may write through a dead context (#138).
+    // Idempotent: cleanup() is called from several completion paths.
+    if (!sessionEnded) {
+      sessionEnded = true;
+      try {
+        adapter.onSessionEnd?.();
+      } catch (e: unknown) {
+        bleLog.debug(`Adapter onSessionEnd failed: ${errMsg(e)}`);
+      }
+    }
   };
 
   const start = async (): Promise<void> => {
@@ -189,7 +227,7 @@ function initializeAdapter(
           return char.read();
         },
         subscribe: async (charUuid) => {
-          const unsub = await subscribeToChar(charMap, charUuid, onNotification);
+          const unsub = await subscribeToChar(charMap, charUuid, onNotification, adapter.name);
           unsubscribers.push(unsub);
         },
       };
@@ -283,7 +321,7 @@ async function subscribeAndInit(
       }
       bleLog.debug(`Subscribing to ${binding.uuid} (${binding.type})...`);
       try {
-        const unsub = await subscribeToChar(charMap, binding.uuid, onNotification);
+        const unsub = await subscribeToChar(charMap, binding.uuid, onNotification, adapter.name);
         unsubscribers.push(unsub);
         subscribed += 1;
       } catch (err) {
@@ -331,7 +369,7 @@ async function subscribeAndInit(
 
     if (!notifyChar || !writeChar) {
       throw new Error(
-        `Required characteristics not found. ` +
+        `Required characteristics not found${adapterSuffix(adapter.name)}. ` +
           `Notify (${adapter.charNotifyUuid ?? '<none>'}): ${!!notifyChar}, ` +
           `Write (${adapter.charWriteUuid ?? '<none>'}): ${!!writeChar}. ` +
           `Discovered: [${[...charMap.keys()].join(', ')}]`,
@@ -344,7 +382,7 @@ async function subscribeAndInit(
     // Legacy mode — subscribe + first unlock in parallel to prevent
     // the scale from disconnecting before receiving the unlock command
     const [unsub] = await Promise.all([
-      subscribeToChar(charMap, effectiveNotifyUuid, onNotification),
+      subscribeToChar(charMap, effectiveNotifyUuid, onNotification, adapter.name),
       startInit(),
     ]);
     unsubscribers.push(unsub);

@@ -92,9 +92,13 @@ BLE Scale Sync now ships with an embedded MQTT broker. If you don't already run 
 
 ### Host tools (install once)
 
+Install the tested host-tool versions:
+
 ```bash
-pip install esptool mpremote
+pip install -r firmware/requirements-flash.txt
 ```
+
+esptool 5.x needs Python 3.10 or newer. If you prefer a virtual environment, create it inside `firmware/` first with `python -m venv venv`, then activate it: `source venv/bin/activate` on macOS and Linux, `source venv/Scripts/activate` in Git Bash on Windows, or `venv\Scripts\Activate.ps1` in PowerShell.
 
 ## Flashing the Firmware
 
@@ -154,8 +158,8 @@ The script auto-detects the serial port. Override with `PORT=/dev/ttyACM0 ./flas
 
   ```powershell
   # 1. Erase + flash MicroPython (download the .bin from micropython.org for your board first)
-  esptool.py --chip esp32s3 --port COM3 erase_flash
-  esptool.py --chip esp32s3 --port COM3 --baud 460800 write_flash -z 0x0 ESP32_GENERIC_S3-SPIRAM_OCT-v1.27.0.bin
+  esptool --chip esp32s3 --port COM3 erase-flash
+  esptool --chip esp32s3 --port COM3 --baud 460800 write-flash 0x0 ESP32_GENERIC_S3-SPIRAM_OCT-v1.27.0.bin
 
   # 2. Install MicroPython libraries
   mpremote connect COM3 mip install aioble
@@ -327,7 +331,8 @@ Compare this to the standard [Docker deployment](/guide/getting-started#docker) 
 | `board_guition_4848.py`      | Guition 4848 config (LVGL display)          |
 | `panel_init_guition_4848.py` | ST7701S panel init sequence data            |
 | `ui.py`                      | LVGL display UI (boards with `HAS_DISPLAY`) |
-| `requirements.txt`           | MicroPython library dependencies            |
+| `mip-packages.txt`           | MicroPython libraries installed via `mip`   |
+| `requirements-flash.txt`     | Pinned host tools for `flash.sh`            |
 
 :::
 

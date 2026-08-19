@@ -68,10 +68,28 @@ describe('HutbitAdapter (#254)', () => {
       expect(makeAdapter().matches(idle)).toBe(true);
     });
 
+    // #318: a second SWAN unit advertises the same MAC-reversed payload with no
+    // status byte at all. Requiring 7 bytes sent it to MGB, whose parser rejects
+    // every AC02 frame this family sends, so the measurement never completed.
+    it('accepts the six-byte MAC-only payload (#318)', () => {
+      const sixByte = swanAdvert('SWAN');
+      sixByte.manufacturerData = { id: 0x02ac, data: Buffer.from('12a291ecb303', 'hex') };
+      expect(isHutbitOemAdvert(sixByte)).toBe(true);
+      expect(makeAdapter().matches(sixByte)).toBe(true);
+      expect(resolveAdapter(sixByte, adapters)?.name).toBe('Hutbit');
+    });
+
+    it('still requires D618 alongside a six-byte payload', () => {
+      const noD618 = swanAdvert('SWAN');
+      noD618.serviceUuids = [uuid16(0xffb0)];
+      noD618.manufacturerData = { id: 0x02ac, data: Buffer.from('12a291ecb303', 'hex') };
+      expect(isHutbitOemAdvert(noD618)).toBe(false);
+    });
+
     it('rejects 0x02AC data that does not fit the signature shape', () => {
-      const wrongLen = swanAdvert('');
-      wrongLen.manufacturerData = { id: 0x02ac, data: Buffer.from('7eb893ecb303', 'hex') };
-      expect(makeAdapter().matches(wrongLen)).toBe(false);
+      const tooShort = swanAdvert('');
+      tooShort.manufacturerData = { id: 0x02ac, data: Buffer.from('93ecb303', 'hex') };
+      expect(makeAdapter().matches(tooShort)).toBe(false);
 
       const wrongStatus = swanAdvert('');
       wrongStatus.manufacturerData = { id: 0x02ac, data: Buffer.from('7eb893ecb303ff', 'hex') };

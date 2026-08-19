@@ -14,6 +14,11 @@ import type {
 import { uuid16 } from './body-comp-helpers.js';
 import { bleLog, errMsg, normalizeUuid } from '../ble/types.js';
 import type { MatchDescriptor } from './match-descriptor.js';
+import {
+  jieliAuthResponseFrame,
+  JIELI_CHALLENGE_FRAME_LEN,
+  JIELI_CHALLENGE_HEADER,
+} from './jieli-auth.js';
 import type { WeightUnit } from '../config/schema.js';
 
 /** Format bytes as hex string for debug logging. */
@@ -58,11 +63,18 @@ const hex = (data: number[] | Buffer): string =>
  *   [2]     protocol type (echoed back in all config commands)
  *   [10]    weight scale flag (1 = /100, else /10)
  *
- * 0x12 frame (ES-26M long format, 18 bytes):
- *   [1]     length (== packet length, i.e. 0x12 == 18)
- *   [2-7]   MAC address (NOT protocol type!)
- *   Protocol type should be set to 0x00 for this variant.
+ * 0x12 frame (long format, byte[1] == packet length):
+ *   [1]     length (18 on the Renpho ES-26M, 20 on the GE CS 10 G)
+ *   [2]     protocol/verify byte (0xff on every captured frame)
+ *   [3-8]   MAC address, little endian
  *   Weight scale factor is 10 (ES-30M format with heuristic /100 fallback).
+ *
+ *   The two dialects agree on the layout and differ in the value the firmware
+ *   ACCEPTS BACK. The 18-byte ES-26M was hardware verified rejecting 0xff and
+ *   working on 0x00 (45e4d6e); on the 20-byte GE CS 10 G the vendor app echoes
+ *   0xff, and its 0x22 start command is then byte identical to ours (#235).
+ *   Note that only the 0x22 matches the app byte for byte: the app's 0x13 and
+ *   0x20 are each one byte longer than ours, and that delta is still unexplained.
  */
 
 // Type 2 UUIDs (most common variant)
@@ -126,6 +138,44 @@ const MAX_STORED_RECORD_AGE_SEC = 90;
 const MAX_STORED_QUERY_ATTEMPTS = 6;
 const STORED_QUERY_RETRY_MS = 3000;
 
+/**
+ * Cap on AE00 challenge responses per session. The captured vendor exchange
+ * contains exactly one scale-issued challenge; more than a couple means the
+ * scale is rejecting the response, and answering forever would be a write storm.
+ */
+const MAX_AE00_RESPONSES = 3;
+
+/**
+ * Smallest 0x12 scale-info frame that carries a usable vendor protocol type at
+ * byte[2]. The 18-byte Renpho ES-26M frame does not: that hardware was verified
+ * working with proto 0x00 (45e4d6e). The 20-byte GE CS 10 G frame does: the
+ * vendor app echoes its byte[2] (0xff) in 0x13/0x20/0x22 on the same scale, and
+ * the frame carries two extra fields before the checksum, so it is a later
+ * revision of the same layout (#235).
+ */
+const EXTENDED_INFO_FRAME_LEN = 20;
+
+/**
+ * Measurement trigger for the extended dialect (#235).
+ *
+ * On the GE CS 10 G the vendor app writes this frame twice immediately after the
+ * 0x22 START, and the 0x10 weight stream begins straight afterwards. Without it
+ * the scale accepts the whole handshake, answers 0x14 and 0x21, and then goes
+ * quiet: @hedoric's retest on the proto fix confirmed every other command is now
+ * byte identical to the app's and this is the only remaining difference.
+ *
+ * It is a well formed QN frame (checksum 0xea = sum of the preceding bytes) but
+ * a DIFFERENT one from the A2 user profile we already send at ready time, which
+ * carries 0x32 and the user's age. Payload bytes 0x1e and 0x23 are constant
+ * across every session in the capture and are replayed verbatim: what they mean
+ * is not known, so they are not derived from anything.
+ */
+const EXTENDED_MEASUREMENT_TRIGGER = [0xa2, 0x06, 0x01, 0x1e, 0x23, 0xea];
+
+/** How many times the vendor app repeats the trigger, and the gap it leaves. */
+const TRIGGER_REPEATS = 2;
+const TRIGGER_GAP_MS = 150;
+
 export class QnScaleAdapter
   implements ScaleAdapterCore, GattWiring, BroadcastSource, MultiCharNotify
 {
@@ -177,6 +227,17 @@ export class QnScaleAdapter
   /** Whether an AE00 challenge frame has already been reported this session. */
   private ae00ChallengeSeen = false;
 
+  /** Serialises every AE01 write within one session (see writeAe01). */
+  private ae01Chain: Promise<void> = Promise.resolve();
+
+  /**
+   * AE00 challenges answered this session. The captured vendor exchange has
+   * exactly one scale-issued challenge, so a scale that keeps challenging is
+   * rejecting our response; answering it forever would be a write storm on a
+   * link that is already failing.
+   */
+  private ae00ResponsesSent = 0;
+
   /**
    * Whether the scale sent a long-frame (18-byte) 0x12 variant (e.g. ES-26M).
    * These scales may never provide impedance, so stable frames with R1=R2=0
@@ -185,6 +246,13 @@ export class QnScaleAdapter
    * R1=R2=0 is correct there.
    */
   private isLongFrameVariant = false;
+
+  /**
+   * Whether the 0x12 frame was the 20-byte extended dialect (#235). That
+   * revision keeps a real protocol type at byte[2] and the vendor app echoes
+   * it, unlike the 18-byte ES-26M frame which needs 0x00.
+   */
+  private isExtendedLongFrame = false;
 
   /**
    * Timestamp (Date.now()) of the first stable R1=R2=0 frame seen on a
@@ -245,15 +313,34 @@ export class QnScaleAdapter
     bleLog.debug(`QN write: [${hex(data)}]`);
   }
 
-  /** Write to AE01 (best-effort, not all firmware has AE00 service). */
+  /**
+   * Write to AE01 (best-effort, not all firmware has AE00 service).
+   *
+   * Serialised through a per-session chain. Three independent paths write here
+   * (the `fe dc ba c0` init from handleScaleInfo, the legacy `pass` frame from
+   * handleReady, and the challenge response below), all fire-and-forget from
+   * notification handlers, and the captured vendor session sends them strictly
+   * in order. Overlapping writes on one characteristic are a transport-level
+   * gamble with nothing to gain.
+   */
   private async writeAe01(data: number[]): Promise<void> {
     if (!this.ctx) return;
-    try {
-      await this.ctx.write(CHR_AE01, data, false);
-      bleLog.debug(`QN AE01 write: [${hex(data)}]`);
-    } catch {
-      // AE01 not available
-    }
+    // Bind the write to the context it was queued for. Links already on the
+    // chain when a session dies would otherwise re-read this.ctx at execution
+    // time and replay a dead session's frame onto the new link, which for an
+    // authentication response means handing the scale a nonce it has forgotten.
+    const owner = this.ctx;
+    const run = async (): Promise<void> => {
+      if (!this.ctx || this.ctx !== owner) return;
+      try {
+        await this.ctx.write(CHR_AE01, data, false);
+        bleLog.debug(`QN AE01 write: [${hex(data)}]`);
+      } catch {
+        // AE01 not available
+      }
+    };
+    this.ae01Chain = this.ae01Chain.then(run, run);
+    return this.ae01Chain;
   }
 
   /**
@@ -274,7 +361,10 @@ export class QnScaleAdapter
     this.hasAe00 = false;
     this.ae02Subscribe = null;
     this.ae00ChallengeSeen = false;
+    this.ae01Chain = Promise.resolve();
+    this.ae00ResponsesSent = 0;
     this.isLongFrameVariant = false;
+    this.isExtendedLongFrame = false;
     this.firstStableNoImpedanceAt = null;
     this.sessionStartedScaleSeconds = Math.floor(Date.now() / 1000) - SCALE_EPOCH_OFFSET;
     this.configSent = false;
@@ -494,17 +584,15 @@ export class QnScaleAdapter
    * Only the positively identified challenge shape is intercepted: 17 bytes
    * whose first byte is 0x00. That byte is the one position identical across all
    * three #75 samples while the remaining 16 are high entropy, so it is the AE00
-   * header rather than payload. Suppressing exactly that shape is
-   * behaviour-identical to today, because parseNotification already returns null
-   * for opcode 0x00. Anything else on AE02 still falls through to the unchanged
-   * parser, so no scale that currently gets a reading over AE02 can lose it.
-   * #75 / #235.
+   * header rather than payload. Anything else on AE02 still falls through to the
+   * unchanged parser, so no scale that currently gets a reading over AE02 can
+   * lose it. #75 / #235.
    */
   parseCharNotification(charUuid: string, data: Buffer): ScaleReading | null {
     if (normalizeUuid(charUuid) === CHR_AE02) {
       bleLog.debug(`QN AE02 (${data.length}B): [${hex(data)}]`);
       if (this.isAe00Challenge(data)) {
-        this.noteAe00Challenge();
+        this.answerAe00Challenge(data);
         return null;
       }
     }
@@ -513,29 +601,58 @@ export class QnScaleAdapter
 
   /** Signature of the AE00 challenge as captured in #75: 17 bytes, header 0x00. */
   private isAe00Challenge(data: Buffer): boolean {
-    return data.length === 17 && data[0] === 0x00;
+    return data.length === JIELI_CHALLENGE_FRAME_LEN && data[0] === JIELI_CHALLENGE_HEADER;
   }
 
   /**
-   * Record the AE00 challenge once per session. No response is sent: the #75
-   * capture contains one challenge and no observed response, which is
-   * information-theoretically insufficient to derive one, and fifteen guessable
-   * AES-128 keys were tried and rejected. Shipping a guess would be worse than
-   * shipping nothing.
+   * Answer an AE00 challenge on AE01.
    *
-   * Logged at debug rather than warn on purpose: the AE00 service is also
-   * present on Renpho ES-CS20M firmware that reads fine, so a warning on every
-   * successful session would be a regression.
+   * The gate is JieLi's RcspAuth: the scale sends `0x00 || challenge[16]` and
+   * withholds every 0x10 weight frame until it receives
+   * `0x01 || E1(linkKey, challenge, addr)`. The transform and its two static
+   * constants were established by @hedoric in #235 from an HCI capture of five
+   * complete vendor-app weigh-ins, and `jieli-auth.ts` reproduces all ten
+   * captured challenge/response pairs plus the Bluetooth specification's own E1
+   * sample vectors.
+   *
+   * Only the scale-issued exchange is answered. The vendor app also issues its
+   * own challenge to the scale first, but the capture shows the scale streams
+   * weight without it, and generating a nonce whose answer we would then have to
+   * validate adds a failure mode for nothing.
+   *
+   * Kept best-effort on purpose: a scale whose firmware uses a different key
+   * simply stays silent exactly as it does today, and the AE00 service is also
+   * present on ES-CS20M firmware that already reads fine.
    */
-  private noteAe00Challenge(): void {
-    if (this.ae00ChallengeSeen) return;
-    this.ae00ChallengeSeen = true;
-    bleLog.debug(
-      'QN: AE00 challenge frame received on AE02 and no response is sent. Scales that ' +
-        'gate measurement frames behind this challenge then stay silent on FFF1. If this ' +
-        'session produces no weight, attach an HCI snoop of the vendor app completing one ' +
-        'weigh-in to #235 so the response can be decoded.',
-    );
+  private answerAe00Challenge(data: Buffer): void {
+    if (this.ae00ResponsesSent >= MAX_AE00_RESPONSES) {
+      if (this.ae00ResponsesSent === MAX_AE00_RESPONSES) {
+        this.ae00ResponsesSent++;
+        bleLog.warn(
+          `QN: the scale re-issued the AE00 challenge more than ${MAX_AE00_RESPONSES} times, ` +
+            'so it is rejecting our response. This firmware likely uses a different ' +
+            'authentication key; please attach a DEBUG log to #235.',
+        );
+      }
+      return;
+    }
+
+    // Count the attempt before it can fail: a challenge shape this code cannot
+    // answer must still consume the budget, or a malformed repeat would be
+    // retried for the whole session.
+    this.ae00ResponsesSent++;
+    let frame: Buffer;
+    try {
+      frame = jieliAuthResponseFrame(data);
+    } catch (e: unknown) {
+      bleLog.debug(`QN: AE00 challenge response could not be computed: ${errMsg(e)}`);
+      return;
+    }
+    if (!this.ae00ChallengeSeen) {
+      this.ae00ChallengeSeen = true;
+      bleLog.debug('QN: AE00 challenge received, answering on AE01 (#235)');
+    }
+    void this.writeAe01([...frame]);
   }
 
   parseNotification(data: Buffer): ScaleReading | null {
@@ -552,17 +669,29 @@ export class QnScaleAdapter
       // MAC address. The classic QN format has ~11 bytes with protocol
       // type at [2] and weight scale flag at [10].
       if (data.length >= 18 && data[1] === data.length) {
-        // Long frame (ES-26M): MAC at [2-7], use proto=0x00
+        // Long frame. Two dialects share this shape and disagree about byte[2]:
+        //   18 bytes (Renpho ES-26M): verified working with proto 0x00 (45e4d6e).
+        //   20 bytes (GE CS 10 G "Fit Plus"): the vendor app echoes data[2] on
+        //     the same hardware, and the frame carries two extra fields before
+        //     the checksum, so it is a later revision of the layout (#235).
         this.isLongFrameVariant = true;
-        this.seenProtocolType = 0x00;
+        this.isExtendedLongFrame = data.length >= EXTENDED_INFO_FRAME_LEN;
+        this.seenProtocolType = this.isExtendedLongFrame ? data[2] : 0x00;
         this.weightScaleFactor = 10;
       } else {
         // Classic short frame
+        this.isLongFrameVariant = false;
+        this.isExtendedLongFrame = false;
         this.seenProtocolType = data[2];
         this.weightScaleFactor = data[10] === 1 ? 100 : 10;
       }
+      const dialect = this.isExtendedLongFrame
+        ? 'extended'
+        : this.isLongFrameVariant
+          ? 'es26m'
+          : 'classic';
       bleLog.debug(
-        `QN: scale info (${data.length}B), ` +
+        `QN: scale info (${data.length}B, dialect=${dialect}), ` +
           `factor=${this.weightScaleFactor}, ` +
           `proto=0x${this.seenProtocolType.toString(16).padStart(2, '0')}`,
       );
@@ -808,6 +937,37 @@ export class QnScaleAdapter
 
     // 0x22 start measurement / stored-data query with echoed protocol type
     await this.writeCmd(this.buildStoredDataQuery());
+
+    // Extended dialect only: the scale needs an explicit trigger after START
+    // before it will stream 0x10 frames (#235). Gated on the dialect because
+    // that is the only firmware the capture covers; every other QN scale in the
+    // registry reads today without it, and an unexplained extra write is not
+    // something to hand them on spec.
+    if (!this.isExtendedLongFrame) return;
+    for (let i = 0; i < TRIGGER_REPEATS; i++) {
+      if (i > 0) await wait(TRIGGER_GAP_MS);
+      await this.writeCmd([...EXTENDED_MEASUREMENT_TRIGGER]);
+    }
+    bleLog.debug('QN: extended-dialect measurement trigger sent (#235)');
+  }
+
+  /**
+   * Drop timers and the connection context when the session ends.
+   *
+   * Both timers write through `this.ctx`. The adapter instance is shared across
+   * sessions, so one left armed past a disconnect fires against a dead link, or
+   * worse against the next session's context. Same class of defect as #138.
+   */
+  onSessionEnd(): void {
+    if (this.fallbackTimer) {
+      clearTimeout(this.fallbackTimer);
+      this.fallbackTimer = null;
+    }
+    if (this.storedRetryTimer) {
+      clearTimeout(this.storedRetryTimer);
+      this.storedRetryTimer = null;
+    }
+    this.ctx = null;
   }
 
   /** Build the 0x22 stored-data query frame with a trailing checksum. */

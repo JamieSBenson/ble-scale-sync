@@ -164,6 +164,7 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
     onLiveData,
     abortSignal,
     bleAdapter,
+    readingTimeoutMs,
   } = opts;
 
   let device: Device | null = null;
@@ -430,7 +431,7 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
         onLiveData,
         scaleAuth,
       ),
-      RAW_READING_TIMEOUT_MS,
+      readingTimeoutMs ?? RAW_READING_TIMEOUT_MS,
       'Timed out waiting for a complete scale reading',
     );
     gattSucceeded = true;

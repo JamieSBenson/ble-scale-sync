@@ -4,7 +4,7 @@ import { isValidScaleId, SCALE_ID_HINT } from '../ble/scale-id.js';
 
 // --- Sub-schemas ---
 
-const EsphomeEndpointSchema = z
+export const EsphomeEndpointSchema = z
   .object({
     host: z.string().min(1, 'ESPHome host is required'),
     port: z.number().int().min(1).max(65535).default(6053),
@@ -114,6 +114,20 @@ export const BleSchema = z
       .regex(/^hci\d+$/, 'Must be a Linux HCI adapter name (e.g., hci0, hci1)')
       .optional()
       .nullable(),
+    /**
+     * Override protocol auto-detection with a named scale adapter (#318/#319).
+     * Note the distinction from `adapter` above, which selects the host's
+     * Bluetooth controller: this one selects the scale protocol.
+     */
+    force_scale_adapter: z.string().min(1).optional().nullable(),
+    /**
+     * How long one GATT session may wait for a complete reading, in seconds
+     * (default 120). Some scales refuse to run a standalone weigh-in while a
+     * host holds the session open (the Beurer BF500 shows "APP", #83), so a
+     * shorter session frees the scale sooner. The cost is proportionally more
+     * Bluetooth adapter resets per hour, since every failed read triggers one.
+     */
+    session_timeout_sec: z.number().int().min(5).max(600).optional().nullable(),
     mqtt_proxy: MqttProxySchema.optional(),
     esphome_proxy: EsphomeProxySchema.optional(),
   })
@@ -125,6 +139,11 @@ export const BleSchema = z
     message: 'esphome_proxy config is required when handler is "esphome-proxy"',
     path: ['esphome_proxy'],
   });
+// NOTE: force_scale_adapter also requires a scale_mac, but that pairing is NOT
+// checked here. Schema validation runs before applyEnvOverrides (yaml-load.ts),
+// so a config.yaml that names a forced adapter and takes its MAC from the
+// documented SCALE_MAC Docker override would be rejected while being perfectly
+// valid. The check lives in src/index.ts, after the effective MAC is known.
 
 export const ScaleSchema = z.object({
   weight_unit: z.enum(['kg', 'lbs']).default('kg'),
@@ -167,6 +186,14 @@ export const UserSchema = z.object({
   // schema parse) still validates.
   beurer_pin: z.coerce.number().int().min(0).max(9999).optional(),
   beurer_user_index: z.coerce.number().int().min(0).max(255).optional(),
+  /**
+   * Write this user's profile (date of birth, gender, height, activity level)
+   * into the scale when it has nothing stored. Removing the batteries wipes
+   * every slot on a Beurer BF7xx/BF9xx (#229), and the vendor app is otherwise
+   * the only way to recreate one. Opt in: the field heuristics are validated
+   * against a single captured device.
+   */
+  beurer_provision: z.boolean().optional(),
 });
 
 export const RuntimeSchema = z.object({

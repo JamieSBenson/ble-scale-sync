@@ -29,11 +29,85 @@ const CHR_HEIGHT = uuid16(0x2a8e); // User Data Service 0x181C
 const CHR_VENDOR_USER_LIST = uuid16(0xfff2); // notify: one frame per user slot
 const CHR_VENDOR_ACTIVITY = uuid16(0xfff3); // read/write: activity level
 
+/** Render bytes as spaced lowercase hex for the diagnostic log lines. */
+const hex = (b: Buffer | number[]): string =>
+  Array.from(b)
+    .map((v) => v.toString(16).padStart(2, '0'))
+    .join(' ');
+
+interface ProfileField {
+  uuid: string;
+  label: string;
+  /** True when the value the scale returned is a real, usable value. */
+  isSet(v: Buffer): boolean;
+  /** Bytes to write when the scale has nothing stored (#229 battery wipe). */
+  fromProfile(p: UserProfile): number[];
+}
+
 /**
  * User Data characteristics the scale expects to be committed after consent,
  * in the order the Beurer app writes them (#229 capture, att.txt 1571-1579).
+ * The order is load bearing, so this stays an array.
+ *
+ * `isSet` answers "does the scale already hold a real value here". It only
+ * decides whether the provisioning path may fill the field in; a populated
+ * profile is always written back byte for byte, exactly as before.
  */
-const PROFILE_CHARS = [CHR_DATE_OF_BIRTH, CHR_GENDER, CHR_HEIGHT, CHR_VENDOR_ACTIVITY];
+const PROFILE_FIELDS: ProfileField[] = [
+  {
+    uuid: CHR_DATE_OF_BIRTH,
+    label: 'date of birth',
+    // Erased flash reads back as 0xff, so 0xffff must not pass as a year.
+    isSet: (v) => {
+      if (v.length < 4) return false;
+      const year = v.readUInt16LE(0);
+      return year >= 1900 && year <= new Date().getFullYear();
+    },
+    fromProfile: (p) => {
+      const born = p.birthDate ? new Date(p.birthDate) : null;
+      if (born && !Number.isNaN(born.getTime())) {
+        const y = born.getFullYear();
+        return [y & 0xff, (y >> 8) & 0xff, born.getMonth() + 1, born.getDate()];
+      }
+      // No birth date in the profile: anchor to 1 January of the derived year.
+      const year = new Date().getFullYear() - Math.max(1, Math.round(p.age));
+      return [year & 0xff, (year >> 8) & 0xff, 1, 1];
+    },
+  },
+  {
+    uuid: CHR_GENDER,
+    label: 'gender',
+    // Male is 0x00, so "non zero" would read a valid male profile as unset.
+    // The cost is that a wiped scale returning 0x00 is indistinguishable from a
+    // real male profile and is therefore never provisioned. Accepted
+    // deliberately: silently rewriting a valid profile is the worse failure.
+    isSet: (v) => v.length >= 1 && v[0] <= 2,
+    fromProfile: (p) => [p.gender === 'female' ? 1 : 0],
+  },
+  {
+    uuid: CHR_HEIGHT,
+    label: 'height',
+    // Bounded for the same reason as the birth year: 0xffff is erased flash,
+    // not a 655 metre person.
+    isSet: (v) => {
+      if (v.length < 2) return false;
+      const cm = v.readUInt16LE(0);
+      return cm >= 50 && cm <= 250;
+    },
+    fromProfile: (p) => {
+      const cm = Math.max(1, Math.round(p.height));
+      return [cm & 0xff, (cm >> 8) & 0xff];
+    },
+  },
+  {
+    uuid: CHR_VENDOR_ACTIVITY,
+    label: 'activity level',
+    isSet: (v) => v.length >= 1 && v[0] > 0 && v[0] < 0xff,
+    // 0x03 is the value the reporter's own app had stored on this exact BF788
+    // (#229 capture). It is not derived from anything in UserProfile.
+    fromProfile: () => [0x03],
+  },
+];
 
 // SIG service UUIDs (normalized 128-bit lowercase form, same as the BLE layer
 // produces via normalizeUuid). Used to corroborate a bare Beurer company id so
@@ -49,6 +123,15 @@ const UCP_CONSENT = 0x02;
 const UCP_RESPONSE = 0x20;
 const UCP_RESULT_SUCCESS = 0x01;
 const UCP_RESULT_NOT_AUTHORIZED = 0x05;
+
+/** User Control Point result codes, so a log line names the failure. */
+const UCP_RESULTS: Record<number, string> = {
+  0x01: 'SUCCESS',
+  0x02: 'OP_CODE_NOT_SUPPORTED',
+  0x03: 'INVALID_PARAMETER',
+  0x04: 'OPERATION_FAILED',
+  0x05: 'USER_NOT_AUTHORIZED',
+};
 
 /**
  * Frames whose embedded timestamp is older than this are treated as cached
@@ -124,6 +207,26 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
   private ctx: ConnectionContext | undefined;
   private session = 0;
   private profileSyncDone = false;
+  /** Scale user slot the consent applies to; used in the log lines. */
+  private userIndex = 1;
+  /** users[].beurer_provision: write the profile into an empty scale (#229). */
+  private provision = false;
+  /** Vendor user-slot records seen on 0xFFF2 this session. */
+  private userSlotsSeen = 0;
+  /** Whether the vendor user list terminated (or reported an error) this session. */
+  private userListAnswered = false;
+  /** Latch so the "no stored users" hint is printed at most once per session. */
+  private emptyListReported = false;
+  /** Whether the scale accepted the consent code this session. */
+  private consentAccepted = false;
+  /** Whether a reading was emitted this session (gates the session-end warning). */
+  private readingEmitted = false;
+  /**
+   * Field labels already warned about, for the process lifetime. In continuous
+   * mode a scale with a legitimately empty field would otherwise print the same
+   * four lines on every cycle, forever.
+   */
+  private readonly warnedFields = new Set<string>();
   /**
    * Composition as it stood when each reading was emitted. Weak so buffered
    * history readings do not pin memory once the processor drops them.
@@ -209,7 +312,8 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
       throw new Error(
         'Beurer BF720/BF105/BF500/BF788/BF950 needs a consent PIN. Set `users[].beurer_pin` in config.yaml ' +
           '(the code the scale was paired with in the Beurer / openScale app, or shown on ' +
-          "the scale's control unit).",
+          "the scale's control unit). If the scale was factory reset or had its batteries " +
+          'removed, every user slot and its code are gone; try `beurer_pin: 0`.',
       );
     }
     const userIndex = ctx.scaleAuth?.userIndex ?? 1;
@@ -221,6 +325,13 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     this.session += 1;
     this.ctx = ctx;
     this.profileSyncDone = false;
+    this.userIndex = userIndex;
+    this.provision = ctx.scaleAuth?.provision === true;
+    this.userSlotsSeen = 0;
+    this.userListAnswered = false;
+    this.emptyListReported = false;
+    this.consentAccepted = false;
+    this.readingEmitted = false;
 
     await ctx.write(CHR_CURRENT_TIME, this.buildCurrentTime(), true);
 
@@ -264,15 +375,38 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
       // capture, and on a sibling model one locked-down or read-only
       // characteristic must not cost us the increment below, which is the step
       // the scale actually waits for.
-      const values = new Map<string, Buffer>();
-      for (const uuid of PROFILE_CHARS) {
-        if (!ctx.availableChars.has(uuid)) continue;
+      const values = new Map<string, Buffer | number[]>();
+      let provisioned = 0;
+      for (const field of PROFILE_FIELDS) {
+        if (!ctx.availableChars.has(field.uuid)) continue;
         if (session !== this.session) return;
+        let stored: Buffer | null = null;
         try {
-          const value = await ctx.read(uuid);
-          if (value.length > 0) values.set(uuid, value);
+          stored = await ctx.read(field.uuid);
         } catch (err) {
-          bleLog.debug(`Beurer BF720: profile read ${uuid} rejected: ${String(err)}`);
+          bleLog.debug(`Beurer BF720: profile read ${field.uuid} rejected: ${String(err)}`);
+          // Never write into a characteristic we were not allowed to read: an
+          // unreadable field is not the same thing as an empty one.
+          continue;
+        }
+        bleLog.debug(`Beurer BF720: stored ${field.label} = [${hex(stored)}]`);
+        // The write-back itself is unconditional, exactly as before this option
+        // existed. Provisioning changes the BYTES, never whether the field is
+        // committed: the scale waits for the full sequence, and dropping a write
+        // on an install that never opted in would be an undeclared change.
+        if (stored.length > 0 && field.isSet(stored)) {
+          values.set(field.uuid, stored);
+        } else if (this.provision) {
+          const filled = field.fromProfile(ctx.profile);
+          values.set(field.uuid, filled);
+          provisioned += 1;
+          bleLog.info(
+            `Beurer BF720: the scale has no stored ${field.label} for user ` +
+              `${this.userIndex}; writing the value from config.yaml [${hex(filled)}]`,
+          );
+        } else {
+          values.set(field.uuid, stored);
+          this.warnUnsetFieldOnce(field.label);
         }
       }
       for (const [uuid, value] of values) {
@@ -288,7 +422,8 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
         await ctx.write(CHR_DB_CHANGE_INCREMENT, [0x01, 0x00, 0x00, 0x00], true);
       }
       bleLog.debug(
-        `Beurer BF720: user profile committed (${values.size} characteristics); scale can complete the measurement`,
+        `Beurer BF720: user profile committed (${values.size} characteristics, ` +
+          `${provisioned} written from config); scale can complete the measurement`,
       );
     } catch (err) {
       // Never fail the reading over this: on firmware that does not need the
@@ -302,15 +437,66 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     if (data.length === 0) return;
     if (data[0] === 0x01) {
       bleLog.debug('Beurer BF720: end of user-slot list');
+      this.userListAnswered = true;
+      this.reportEmptyUserList();
       return;
     }
-    if (data[0] !== 0x00 || data.length < 12) return;
-    const slot = data[1];
-    const year = data.readUInt16LE(5);
-    const height = data[9];
-    const gender = data[10] === 0 ? 'male' : 'female';
-    bleLog.debug(
-      `Beurer BF720: user slot ${slot} (born ${year}-${data[7]}-${data[8]}, ${height} cm, ${gender}, activity ${data[11]})`,
+    if (data[0] === 0x00) {
+      // A truncated record still proves a slot exists; only its layout is
+      // unknown. Counting it is what stops the "no stored users" hint firing on
+      // a scale that plainly has one.
+      this.userSlotsSeen += 1;
+      if (data.length < 12) {
+        bleLog.debug(`Beurer BF720: short user-slot record (${data.length}B), not decoded`);
+        return;
+      }
+      const slot = data[1];
+      const year = data.readUInt16LE(5);
+      const height = data[9];
+      // byte 10 was labelled gender, but the #229 capture has 0x01 here while
+      // the same device's 0x2A8C reads back 0x00 (male). Report it raw.
+      bleLog.debug(
+        `Beurer BF720: user slot ${slot} (born ${year}-${data[7]}-${data[8]}, ${height} cm, ` +
+          `raw10=0x${data[10].toString(16).padStart(2, '0')}, activity ${data[11]})`,
+      );
+      return;
+    }
+    // An unrecognised status byte still means the scale answered and named no
+    // slot. On its own that is weak evidence, which is why reportEmptyUserList
+    // also requires the consent to have been refused before it says anything.
+    bleLog.debug(`Beurer BF720: user-list status 0x${data[0].toString(16).padStart(2, '0')}`);
+    this.userListAnswered = true;
+    this.reportEmptyUserList();
+  }
+
+  /** Warn once per process that a profile field came back empty. */
+  private warnUnsetFieldOnce(label: string): void {
+    if (this.warnedFields.has(label)) return;
+    this.warnedFields.add(label);
+    bleLog.warn(
+      `Beurer BF720: the scale has no stored ${label} for user ${this.userIndex}. ` +
+        'Set `users[].beurer_provision: true` to write it from config.yaml.',
+    );
+  }
+
+  /**
+   * Say plainly that the scale holds no user profiles at all (#229).
+   *
+   * Removing the batteries wipes every slot and its consent code, so no code
+   * the scale was previously paired with can be correct, and the bare
+   * USER_NOT_AUTHORIZED warning sends people hunting for the right PIN.
+   */
+  private reportEmptyUserList(): void {
+    if (this.emptyListReported || !this.userListAnswered || this.userSlotsSeen > 0) return;
+    // A scale that accepted the consent code is working. Telling that user to
+    // switch to beurer_pin 0 would break a setup that reads fine today.
+    if (this.consentAccepted) return;
+    this.emptyListReported = true;
+    bleLog.warn(
+      'Beurer BF720: the scale reports no stored user profiles. Removing the batteries ' +
+        'wipes every user slot and its consent code, so no code the scale was previously ' +
+        'paired with can be correct. On a scale in that state, try `users[].beurer_pin: 0`, ' +
+        'and set `users[].beurer_provision: true` to write the profile back from config.yaml.',
     );
   }
 
@@ -360,8 +546,19 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
 
   private handleUcpResponse(data: Buffer): void {
     if (data.length < 3 || data[0] !== UCP_RESPONSE) return;
+    // data[1] echoes the request opcode. Without this gate a response to some
+    // other operation was read as a consent result.
+    if (data[1] !== UCP_CONSENT) {
+      bleLog.debug(
+        `Beurer BF720: User Control Point response to opcode ` +
+          `0x${data[1].toString(16).padStart(2, '0')}, ignored`,
+      );
+      return;
+    }
     const result = data[2];
+    const name = UCP_RESULTS[result] ?? `0x${result.toString(16).padStart(2, '0')}`;
     if (result === UCP_RESULT_SUCCESS) {
+      this.consentAccepted = true;
       bleLog.debug('Beurer BF720: consent accepted, awaiting measurement');
       void this.syncUserProfile(this.session);
     } else if (result === UCP_RESULT_NOT_AUTHORIZED) {
@@ -370,8 +567,42 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
           'and `users[].beurer_user_index` match the slot the scale was paired with.',
       );
     } else {
-      bleLog.debug(`Beurer BF720: User Control Point result 0x${result.toString(16)}`);
+      bleLog.warn(`Beurer BF720: User Control Point rejected the consent (${name}).`);
     }
+    // The vendor user list can answer either side of this indication, so both
+    // paths ask; reportEmptyUserList is latched and only fires once it knows.
+    this.reportEmptyUserList();
+  }
+
+  /**
+   * Drop the connection context when the session ends (#138).
+   *
+   * Deliberately does NOT bump `session`: cleanup() runs from finishWith while
+   * the link is still up, and syncUserProfile re-checks the session before
+   * every await, so bumping it could abort a commit half way and leave the
+   * profile written but the increment not bumped. The loop snapshots ctx into a
+   * local, so an in-flight commit still finishes.
+   */
+  onSessionEnd(): void {
+    // Only when nothing was emitted at all. cachedComp is reset by every zeroed
+    // composition stub, so testing it alone would fire on a successful session
+    // that happened to end with a stub.
+    if (!this.readingEmitted && this.cachedWeight > 0) {
+      bleLog.warn(
+        `Beurer BF720: the session ended with a weight (${this.cachedWeight.toFixed(2)} kg) ` +
+          'but no usable body-composition values, so no reading was emitted. Either no ' +
+          'composition frame arrived or every one of them was zeroed. Please report this ' +
+          'log on issue #229.',
+      );
+    }
+    // Clearing the cache here, not only in onConnected, matters: multi-char
+    // subscriptions are enabled before onConnected is awaited, so a frame from
+    // the next session could otherwise be parsed against this session's values
+    // and inherit its composition snapshot and timestamp.
+    this.ctx = undefined;
+    this.cachedWeight = 0;
+    this.cachedTimestamp = undefined;
+    this.cachedComp = {};
   }
 
   /** Decode a 7-byte SIG timestamp; return undefined on a zero/invalid date. */
@@ -526,6 +757,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     // entry whatever happened to be cached at the END of the session. With a
     // snapshot each reading keeps the composition it was actually built from.
     this.compByReading.set(reading, { ...this.cachedComp });
+    this.readingEmitted = true;
     return reading;
   }
 

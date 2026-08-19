@@ -36,6 +36,7 @@ export class PollReadingSource implements ReadingSource {
       scaleAuth: {
         pin: primaryUser.beurer_pin,
         userIndex: primaryUser.beurer_user_index,
+        provision: primaryUser.beurer_provision,
       },
       weightUnit: this.ctx.weightUnit,
       abortSignal: signal,
@@ -43,6 +44,9 @@ export class PollReadingSource implements ReadingSource {
       mqttProxy: this.ctx.mqttProxy,
       esphomeProxy: this.ctx.esphomeProxy,
       bleAdapter: this.ctx.bleAdapter,
+      readingTimeoutMs: this.ctx.config.ble?.session_timeout_sec
+        ? this.ctx.config.ble.session_timeout_sec * 1000
+        : undefined,
       onLiveData: (reading) => {
         const impStr: string = reading.impedance > 0 ? `${reading.impedance} Ohm` : 'Measuring...';
         process.stdout.write(

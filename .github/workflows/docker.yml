@@ -52,6 +52,7 @@ jobs:
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ github.event_name == 'release' }}
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=raw,value=dev-{{sha}},enable=${{ github.ref == 'refs/heads/dev' }}
             type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push
@@ -63,7 +64,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ inputs.tag || github.ref_name }}
             BUILD_DATE=${{ github.event.release.created_at || github.event.head_commit.timestamp }}
             VCS_REF=${{ github.sha }}
           cache-from: type=gha

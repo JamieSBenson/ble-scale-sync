@@ -114,6 +114,8 @@ export interface ScanOptions {
   mqttProxy?: MqttProxyConfig;
   esphomeProxy?: EsphomeProxyConfig;
   bleAdapter?: string;
+  /** Override RAW_READING_TIMEOUT_MS for one session (ble.session_timeout_sec, #83). */
+  readingTimeoutMs?: number;
 }
 
 export interface ScanResult {

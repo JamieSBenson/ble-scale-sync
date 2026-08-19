@@ -37,6 +37,7 @@ map:
 options:
   scale_mac: ''
   ble_adapter: ''
+  force_scale_adapter: ''
   weight_unit: kg
   height_unit: cm
   user_name: Default
@@ -64,6 +65,7 @@ options:
 schema:
   scale_mac: str?
   ble_adapter: str?
+  force_scale_adapter: str?
   weight_unit: list(kg|lbs)
   height_unit: list(cm|in)
   user_name: str

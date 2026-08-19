@@ -2,8 +2,9 @@
 #
 # Flash MicroPython + BLE-MQTT bridge firmware to an ESP32 / ESP32-S3.
 #
-# Prerequisites (install once):
-#   pip install esptool mpremote
+# Prerequisites (install once, from this directory):
+#   pip install -r requirements-flash.txt
+# esptool 5.x needs Python 3.10 or newer.
 #
 # Usage:
 #   ./flash.sh                          # full flash (auto-detect board)
@@ -51,7 +52,8 @@ blue()  { printf '\033[0;34m%s\033[0m\n' "$*"; }
 die() { red "Error: $*" >&2; exit 1; }
 
 check_tool() {
-  command -v "$1" >/dev/null 2>&1 || die "$1 not found. Install with: pip install $1"
+  # The script cd's to its own directory above, so the path is relative to firmware/.
+  command -v "$1" >/dev/null 2>&1 || die "$1 not found. Install with: pip install -r requirements-flash.txt"
 }
 
 # ─── Board configuration ─────────────────────────────────────────────────────
@@ -106,7 +108,7 @@ detect_board() {
   local port="$1"
   blue "Auto-detecting board..."
   local chip_info
-  chip_info=$(esptool.py --port "$port" chip_id 2>&1) || die "Could not identify chip. Is the ESP32 in download mode?"
+  chip_info=$(esptool --port "$port" chip-id 2>&1) || die "Could not identify chip. Is the ESP32 in download mode?"
 
   if echo "$chip_info" | grep -qi "ESP32-S3"; then
     green "Detected: ESP32-S3"
@@ -179,10 +181,10 @@ download_firmware() {
 erase_and_flash() {
   local port="$1"
   blue "Erasing flash..."
-  esptool.py --chip "$CHIP" --port "$port" erase_flash
+  esptool --chip "$CHIP" --port "$port" erase-flash
 
   blue "Flashing MicroPython v${MICROPYTHON_VERSION} (${CHIP})..."
-  esptool.py --chip "$CHIP" --port "$port" --baud "$BAUD" write_flash -z "$FLASH_OFFSET" "$FIRMWARE_FILE"
+  esptool --chip "$CHIP" --port "$port" --baud "$BAUD" write-flash "$FLASH_OFFSET" "$FIRMWARE_FILE"
   green "MicroPython flashed successfully"
 
   blue "Waiting for device to reboot..."
@@ -257,7 +259,7 @@ main() {
     esac
   done
 
-  check_tool esptool.py
+  check_tool esptool
   check_tool mpremote
 
   local port

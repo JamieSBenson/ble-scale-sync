@@ -5,6 +5,8 @@ const require = createRequire(import.meta.url);
 const pkg = require('../../package.json');
 
 export default defineConfig({
+  // Planning and design notes live in the repo, not on the public site.
+  srcExclude: ['superpowers/**'],
   title: 'BLE Scale Sync',
   description:
     'Automatic body composition sync from BLE smart scales to Garmin Connect, Home Assistant, InfluxDB and more.',

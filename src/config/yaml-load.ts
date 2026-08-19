@@ -7,6 +7,7 @@ import type { AppConfig } from './schema.js';
 import { DEFAULT_CONFIG_PATH, DEFAULT_ENV_PATH } from './paths.js';
 import { resolveEnvReferences } from './env-refs.js';
 import { applyEnvOverrides, filterValidExporters } from './env-overrides.js';
+import { collectUnknownKeys } from './unknown-keys.js';
 
 const log = createLogger('Config');
 
@@ -23,6 +24,15 @@ export function loadYamlConfig(configPath?: string): AppConfig {
   const raw = readFileSync(yamlPath, 'utf8');
   const parsed: unknown = parseYaml(raw);
   const resolved = resolveEnvReferences(parsed);
+
+  // Before validation on purpose: an unknown key is worth naming even when the
+  // config fails to parse for an unrelated reason (#318).
+  for (const key of collectUnknownKeys(resolved)) {
+    log.warn(
+      `Unknown config key '${key}' in ${yamlPath}. It is ignored. If you copied it from ` +
+        'the documentation, this build is older than that key: update the app.',
+    );
+  }
 
   const result = AppConfigSchema.safeParse(resolved);
   if (!result.success) {

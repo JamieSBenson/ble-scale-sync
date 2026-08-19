@@ -215,7 +215,7 @@ ble-scale-sync/
 │   ├── board_*.py                   # Per-board pin/display setup (Atom Echo, S3, Guition)
 │   ├── ui.py, beep.py, panel_init_*.py
 │   ├── flash.sh                     # Board flashing helper
-│   ├── requirements.txt, config.json.example
+│   ├── mip-packages.txt, requirements-flash.txt, config.json.example
 │   └── tools/
 ├── worker/                          # Cloudflare Worker for stats.blescalesync.dev
 │   ├── src/, wrangler.toml, package.json, tsconfig.json

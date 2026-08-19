@@ -39,6 +39,12 @@ export interface UserProfile {
   age: number;
   gender: Gender;
   isAthlete: boolean;
+  /**
+   * ISO birth date (YYYY-MM-DD) when config supplied one. Body composition uses
+   * `age`; this exists for scales that store a date of birth on the device, so
+   * provisioning does not have to invent a 1 January anniversary (#229).
+   */
+  birthDate?: string;
 }
 
 export interface BodyComposition {
@@ -93,6 +99,8 @@ export interface ScaleAuth {
   pin?: number;
   /** Scale user slot index the consent applies to (defaults to 1). */
   userIndex?: number;
+  /** Write the configured profile into a scale that has nothing stored (#229). */
+  provision?: boolean;
 }
 
 export interface ConnectionContext {
@@ -186,6 +194,30 @@ export interface ScaleAdapterCore {
    * top of it.
    */
   onConnected?(context: ConnectionContext): Promise<void> | void;
+
+  /**
+   * Called once when a GATT session ends, however it ends: a completed reading,
+   * a disconnect, a timeout or an init failure.
+   *
+   * Adapters are shared singletons, so anything captured from a
+   * `ConnectionContext` (a write function, a queued frame, a negotiated
+   * password) outlives the link it belongs to. Without a teardown signal an
+   * adapter cannot tell "no connection yet" from "the previous connection", and
+   * writing through a stale context is silent data loss at best (#138).
+   *
+   * Must not throw and must not perform I/O: the session is already gone.
+   */
+  onSessionEnd?(): void;
+
+  /**
+   * Set only on the wrapper produced by `ble.force_scale_adapter`.
+   *
+   * Detection normally guarantees that an adapter was selected BY the
+   * advertisement in front of it, and parts of the pipeline lean on that. A
+   * forced adapter breaks the guarantee on purpose, so those places need to be
+   * able to tell (see `hasParseableBroadcastSource`).
+   */
+  readonly isForcedOverride?: boolean;
 
   matches(device: BleDeviceInfo): boolean;
   parseNotification(data: Buffer): ScaleReading | null;
