@@ -21,5 +21,7 @@ jobs:
           image-names: ble-scale-sync
           cut-off: 30d
           keep-n-most-recent: 10
-          skip-tags: "latest|\\d+(\\.\\d+)*"
+          # dev is the channel reporters are asked to test unreleased fixes on,
+          # so a quiet month must not prune it out from under them.
+          skip-tags: "latest|dev|\\d+(\\.\\d+)*"
           token-type: github-token

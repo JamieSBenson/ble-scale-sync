@@ -25,6 +25,12 @@ LABEL org.opencontainers.image.title="BLE Scale Sync" \
       org.opencontainers.image.source="https://github.com/KristianP26/ble-scale-sync" \
       org.opencontainers.image.licenses="GPL-3.0"
 
+# Surface the build identity at runtime. OCI labels cannot be read from inside a
+# running container and package.json only moves at release time, so without these
+# a :dev image and a :latest image are indistinguishable in a log (#318).
+ENV APP_BUILD_CHANNEL=${VERSION}
+ENV APP_BUILD_REF=${VCS_REF}
+
 # System dependencies: BLE (BlueZ + D-Bus), Python (Garmin upload), tini (PID 1),
 # build-essential (node-gyp needs gcc/g++/make for native BLE modules),
 # python3-dev + libffi-dev + libssl-dev + libcurl4-openssl-dev

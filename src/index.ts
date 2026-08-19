@@ -1,6 +1,7 @@
 #!/usr/bin/env tsx
 
 import { parseArgs } from 'node:util';
+import { createRequire } from 'node:module';
 import { setDisplayUsers, createMqttProxyDisplayNotifier } from './ble/handler-mqtt-proxy/index.js';
 import { bootstrapMqttProxy } from './ble/mqtt-proxy-bootstrap.js';
 import { notifyReady, startHeartbeat, stopHeartbeat } from './runtime/systemd-watchdog.js';
@@ -12,6 +13,9 @@ import { assertRegistryIntegrity } from './scales/registry-check.js';
 import { createLogger, setLogLevel, LogLevel } from './logger.js';
 import { errMsg } from './utils/error.js';
 import { runHealthchecks } from './orchestrator.js';
+
+const require = createRequire(import.meta.url);
+const pkg = require('../package.json') as { version: string };
 import { loadAppConfig } from './config/load.js';
 import { resolveRuntimeConfig } from './config/resolve.js';
 import { startConfigWatcher, type ConfigWatcherHandle } from './config/watch.js';
@@ -255,6 +259,16 @@ async function main(): Promise<void> {
         'If auto-detection picked the wrong adapter, please report it so the matcher can be fixed.',
     );
   }
+  // Build identity. #318 was diagnosed only after ruling out "the option does
+  // nothing" against "the container predates the option", and nothing in the log
+  // separated those. APP_BUILD_* are set by the image build; on a bare checkout
+  // they are absent and only the package version is printed.
+  const buildChannel = process.env.APP_BUILD_CHANNEL;
+  const buildRef = process.env.APP_BUILD_REF;
+  const buildSuffix = buildChannel
+    ? ` (image ${buildChannel}${buildRef ? ` @ ${buildRef.slice(0, 7)}` : ''})`
+    : '';
+  log.info(`Version ${pkg.version}${buildSuffix}`);
   log.info(`Adapters: ${adapters.map((a) => a.name).join(', ')}\n`);
 
   // Inject runtime config into adapters that read it: the Xiaomi S800 MiBeacon
