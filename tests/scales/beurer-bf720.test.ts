@@ -3,6 +3,7 @@ import { BeurerBf720Adapter } from '../../src/scales/beurer-bf720.js';
 import { resolveAdapter } from '../../src/scales/resolve.js';
 import type { BleDeviceInfo, ConnectionContext } from '../../src/interfaces/scale-adapter.js';
 import { uuid16 } from '../../src/scales/body-comp-helpers.js';
+import { bleLog } from '../../src/ble/types.js';
 import {
   mockPeripheral,
   defaultProfile,
@@ -570,6 +571,212 @@ describe('BeurerBf720Adapter', () => {
       expect(a.parseCharNotification(CHR_FFF2, Buffer.from('01', 'hex'))).toBeNull();
       expect(a.parseCharNotification(CHR_FFF2, Buffer.from('0001ff', 'hex'))).toBeNull();
       expect(a.parseCharNotification(CHR_FFF2, Buffer.alloc(0))).toBeNull();
+    });
+  });
+
+  // -- #229: a scale whose user slots were wiped by a battery change ---------
+  describe('unprovisioned scale after a battery change (#229)', () => {
+    const UCP = uuid16(0x2a9f);
+    const FFF2 = uuid16(0xfff2);
+    const FFF3 = uuid16(0xfff3);
+    const DOB = uuid16(0x2a85);
+    const GENDER = uuid16(0x2a8c);
+    const HEIGHT = uuid16(0x2a8e);
+    const DBINC = uuid16(0x2a99);
+
+    const ALL_CHARS = new Set([
+      uuid16(0x2a9d),
+      uuid16(0x2a9c),
+      UCP,
+      FFF2,
+      FFF3,
+      DOB,
+      GENDER,
+      HEIGHT,
+      DBINC,
+    ]);
+
+    const settle = async (): Promise<void> => {
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    };
+
+    /** A context whose stored profile values are whatever `stored` says. */
+    function ctxWith(
+      stored: Record<string, Buffer>,
+      opts: { provision?: boolean; profile?: ConnectionContext['profile'] } = {},
+    ): ConnectionContext {
+      return {
+        profile: opts.profile ?? defaultProfile(),
+        deviceAddress: 'E7DB49F186DE',
+        availableChars: ALL_CHARS,
+        scaleAuth: { pin: 3752, userIndex: 1, provision: opts.provision },
+        write: vi.fn().mockResolvedValue(undefined),
+        read: vi.fn(async (uuid: string) => stored[uuid] ?? Buffer.alloc(0)),
+        subscribe: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ConnectionContext;
+    }
+
+    const ZEROED: Record<string, Buffer> = {
+      [DOB]: Buffer.from('00000000', 'hex'),
+      [GENDER]: Buffer.from('ff', 'hex'),
+      [HEIGHT]: Buffer.from('0000', 'hex'),
+      [FFF3]: Buffer.from('00', 'hex'),
+    };
+
+    const POPULATED: Record<string, Buffer> = {
+      [DOB]: Buffer.from('bf070808', 'hex'),
+      [GENDER]: Buffer.from('00', 'hex'),
+      [HEIGHT]: Buffer.from('c000', 'hex'),
+      [FFF3]: Buffer.from('03', 'hex'),
+    };
+
+    /** Writes recorded after consent was accepted. */
+    async function writesAfterConsent(
+      a: BeurerBf720Adapter,
+      ctx: ConnectionContext,
+    ): Promise<[string, Buffer | number[]][]> {
+      await a.onConnected(ctx);
+      const write = ctx.write as ReturnType<typeof vi.fn>;
+      write.mockClear();
+      a.parseCharNotification(UCP, Buffer.from('200201', 'hex'));
+      await settle();
+      return write.mock.calls.map((c) => [c[0] as string, c[1] as Buffer | number[]]);
+    }
+
+    it('does not write a config value when the profile read is rejected', async () => {
+      const a = makeAdapter();
+      const ctx = ctxWith({}, { provision: true });
+      (ctx.read as ReturnType<typeof vi.fn>).mockImplementation(async (uuid: string) => {
+        if (uuid === HEIGHT) throw new Error('read not permitted');
+        return ZEROED[uuid] ?? Buffer.alloc(0);
+      });
+      const writes = await writesAfterConsent(a, ctx);
+      expect(writes.map((w) => w[0])).not.toContain(HEIGHT);
+      expect(writes.map((w) => w[0])).toContain(DBINC);
+    });
+
+    it('warns instead of writing when provisioning is off', async () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const a = makeAdapter();
+      const writes = await writesAfterConsent(a, ctxWith(ZEROED));
+      expect(writes.map((w) => w[0])).not.toContain(DOB);
+      expect(warn.mock.calls.flat().join(' ')).toMatch(/no stored date of birth/);
+      warn.mockRestore();
+    });
+
+    it('writes the configured date of birth when 0x2A85 reads back zeroed', async () => {
+      const a = makeAdapter();
+      const writes = await writesAfterConsent(a, ctxWith(ZEROED, { provision: true }));
+      const year = new Date().getFullYear() - 30;
+      expect(writes.find((w) => w[0] === DOB)?.[1]).toEqual([
+        year & 0xff,
+        (year >> 8) & 0xff,
+        1,
+        1,
+      ]);
+    });
+
+    it('writes the configured height when 0x2A8E reads back 0000', async () => {
+      const a = makeAdapter();
+      const writes = await writesAfterConsent(a, ctxWith(ZEROED, { provision: true }));
+      expect(writes.find((w) => w[0] === HEIGHT)?.[1]).toEqual([0xb7, 0x00]);
+    });
+
+    it('writes the configured gender when 0x2A8C reads back ff', async () => {
+      const female = makeAdapter();
+      const femaleWrites = await writesAfterConsent(
+        female,
+        ctxWith(ZEROED, { provision: true, profile: defaultProfile({ gender: 'female' }) }),
+      );
+      expect(femaleWrites.find((w) => w[0] === GENDER)?.[1]).toEqual([0x01]);
+
+      const male = makeAdapter();
+      const maleWrites = await writesAfterConsent(male, ctxWith(ZEROED, { provision: true }));
+      expect(maleWrites.find((w) => w[0] === GENDER)?.[1]).toEqual([0x00]);
+    });
+
+    it('restores the vendor activity level when 0xFFF3 reads back 00', async () => {
+      const a = makeAdapter();
+      const writes = await writesAfterConsent(a, ctxWith(ZEROED, { provision: true }));
+      expect(writes.find((w) => w[0] === FFF3)?.[1]).toEqual([0x03]);
+    });
+
+    // Guards every working BF105 / BF720 / BF500 install: a populated profile is
+    // written back byte for byte and never touched by provisioning.
+    it('leaves a populated profile byte for byte unchanged even with provisioning on', async () => {
+      const info = vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+      const a = makeAdapter();
+      const writes = await writesAfterConsent(a, ctxWith(POPULATED, { provision: true }));
+      for (const [uuid, value] of writes) {
+        if (uuid === DBINC) continue;
+        expect(Buffer.from(value).toString('hex')).toBe(POPULATED[uuid].toString('hex'));
+      }
+      expect(info.mock.calls.flat().join(' ')).not.toMatch(/writing the value from config/);
+      info.mockRestore();
+    });
+
+    it('still bumps the database change increment after provisioning', async () => {
+      const a = makeAdapter();
+      const writes = await writesAfterConsent(a, ctxWith(ZEROED, { provision: true }));
+      const last = writes[writes.length - 1];
+      expect(last[0]).toBe(DBINC);
+      expect(Buffer.from(last[1]).toString('hex')).toBe('01000000');
+    });
+  });
+
+  describe('empty vendor user list (#229)', () => {
+    const FFF2 = uuid16(0xfff2);
+    const EMPTY = /no stored user profiles/;
+
+    it('warns that the scale has no users when 0xFFF2 answers 02', () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const a = makeAdapter();
+      expect(a.parseCharNotification(FFF2, Buffer.from('02', 'hex'))).toBeNull();
+      expect(warn.mock.calls.flat().join(' ')).toMatch(EMPTY);
+      warn.mockRestore();
+    });
+
+    it('warns when the list terminates with 01 and no slot records', () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const a = makeAdapter();
+      a.parseCharNotification(FFF2, Buffer.from('01', 'hex'));
+      expect(warn.mock.calls.flat().join(' ')).toMatch(EMPTY);
+      warn.mockRestore();
+    });
+
+    it('stays quiet when a slot record was listed', () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const a = makeAdapter();
+      a.parseCharNotification(FFF2, Buffer.from('0001ffffffbf070808c00103', 'hex'));
+      a.parseCharNotification(FFF2, Buffer.from('01', 'hex'));
+      expect(warn.mock.calls.flat().join(' ')).not.toMatch(EMPTY);
+      warn.mockRestore();
+    });
+
+    it('does not report an empty user list for a truncated slot record', () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const a = makeAdapter();
+      expect(a.parseCharNotification(FFF2, Buffer.from('0001ff', 'hex'))).toBeNull();
+      expect(warn.mock.calls.flat().join(' ')).not.toMatch(EMPTY);
+      warn.mockRestore();
+    });
+
+    it('does not report an empty user list for a zero-length frame', () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const a = makeAdapter();
+      expect(a.parseCharNotification(FFF2, Buffer.alloc(0))).toBeNull();
+      expect(warn.mock.calls.flat().join(' ')).not.toMatch(EMPTY);
+      warn.mockRestore();
+    });
+
+    it('warns only once per session', () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const a = makeAdapter();
+      a.parseCharNotification(FFF2, Buffer.from('02', 'hex'));
+      a.parseCharNotification(FFF2, Buffer.from('02', 'hex'));
+      const hits = warn.mock.calls.filter((c) => String(c[0]).includes('no stored user')).length;
+      expect(hits).toBe(1);
+      warn.mockRestore();
     });
   });
 });

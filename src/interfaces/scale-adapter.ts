@@ -93,6 +93,8 @@ export interface ScaleAuth {
   pin?: number;
   /** Scale user slot index the consent applies to (defaults to 1). */
   userIndex?: number;
+  /** Write the configured profile into a scale that has nothing stored (#229). */
+  provision?: boolean;
 }
 
 export interface ConnectionContext {

@@ -38,6 +38,7 @@ export async function buildReadingSource(
   const scaleAuth = () => ({
     pin: ctx.config.users[0]?.beurer_pin,
     userIndex: ctx.config.users[0]?.beurer_user_index,
+    provision: ctx.config.users[0]?.beurer_provision,
   });
 
   const plan = await createReadingSource({
