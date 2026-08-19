@@ -331,7 +331,7 @@ Compare this to the standard [Docker deployment](/guide/getting-started#docker) 
 | `board_guition_4848.py`      | Guition 4848 config (LVGL display)          |
 | `panel_init_guition_4848.py` | ST7701S panel init sequence data            |
 | `ui.py`                      | LVGL display UI (boards with `HAS_DISPLAY`) |
-| `requirements.txt`           | MicroPython libraries installed via `mip`   |
+| `mip-packages.txt`           | MicroPython libraries installed via `mip`   |
 | `requirements-flash.txt`     | Pinned host tools for `flash.sh`            |
 
 :::

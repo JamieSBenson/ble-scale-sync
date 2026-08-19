@@ -18,3 +18,17 @@ updates:
       prefix: "ci:"
     labels:
       - ci
+
+  # Host tools for firmware/flash.sh only. Scoped to /firmware, which now holds
+  # exactly one pip manifest: the MicroPython package list was renamed to
+  # mip-packages.txt because Dependabot treats any file whose name contains
+  # "requirements" as a pip manifest, and its `aioble` entry collides with an
+  # unrelated PyPI package.
+  - package-ecosystem: pip
+    directory: /firmware
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "deps:"
+    labels:
+      - dependencies
