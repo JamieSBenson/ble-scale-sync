@@ -155,6 +155,27 @@ const MAX_AE00_RESPONSES = 3;
  */
 const EXTENDED_INFO_FRAME_LEN = 20;
 
+/**
+ * Measurement trigger for the extended dialect (#235).
+ *
+ * On the GE CS 10 G the vendor app writes this frame twice immediately after the
+ * 0x22 START, and the 0x10 weight stream begins straight afterwards. Without it
+ * the scale accepts the whole handshake, answers 0x14 and 0x21, and then goes
+ * quiet: @hedoric's retest on the proto fix confirmed every other command is now
+ * byte identical to the app's and this is the only remaining difference.
+ *
+ * It is a well formed QN frame (checksum 0xea = sum of the preceding bytes) but
+ * a DIFFERENT one from the A2 user profile we already send at ready time, which
+ * carries 0x32 and the user's age. Payload bytes 0x1e and 0x23 are constant
+ * across every session in the capture and are replayed verbatim: what they mean
+ * is not known, so they are not derived from anything.
+ */
+const EXTENDED_MEASUREMENT_TRIGGER = [0xa2, 0x06, 0x01, 0x1e, 0x23, 0xea];
+
+/** How many times the vendor app repeats the trigger, and the gap it leaves. */
+const TRIGGER_REPEATS = 2;
+const TRIGGER_GAP_MS = 150;
+
 export class QnScaleAdapter
   implements ScaleAdapterCore, GattWiring, BroadcastSource, MultiCharNotify
 {
@@ -916,6 +937,37 @@ export class QnScaleAdapter
 
     // 0x22 start measurement / stored-data query with echoed protocol type
     await this.writeCmd(this.buildStoredDataQuery());
+
+    // Extended dialect only: the scale needs an explicit trigger after START
+    // before it will stream 0x10 frames (#235). Gated on the dialect because
+    // that is the only firmware the capture covers; every other QN scale in the
+    // registry reads today without it, and an unexplained extra write is not
+    // something to hand them on spec.
+    if (!this.isExtendedLongFrame) return;
+    for (let i = 0; i < TRIGGER_REPEATS; i++) {
+      if (i > 0) await wait(TRIGGER_GAP_MS);
+      await this.writeCmd([...EXTENDED_MEASUREMENT_TRIGGER]);
+    }
+    bleLog.debug('QN: extended-dialect measurement trigger sent (#235)');
+  }
+
+  /**
+   * Drop timers and the connection context when the session ends.
+   *
+   * Both timers write through `this.ctx`. The adapter instance is shared across
+   * sessions, so one left armed past a disconnect fires against a dead link, or
+   * worse against the next session's context. Same class of defect as #138.
+   */
+  onSessionEnd(): void {
+    if (this.fallbackTimer) {
+      clearTimeout(this.fallbackTimer);
+      this.fallbackTimer = null;
+    }
+    if (this.storedRetryTimer) {
+      clearTimeout(this.storedRetryTimer);
+      this.storedRetryTimer = null;
+    }
+    this.ctx = null;
   }
 
   /** Build the 0x22 stored-data query frame with a trailing checksum. */

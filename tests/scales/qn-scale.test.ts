@@ -1082,6 +1082,34 @@ describe('AE02 dispatch (#75, #235)', () => {
     vi.restoreAllMocks();
   });
 
+  describe('onSessionEnd (#235)', () => {
+    it('clears the fallback timer so it cannot fire against a dead session', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = makeAdapter();
+        const writes: number[][] = [];
+        const ctx = {
+          write: async (_uuid: string, data: Buffer | number[]) => {
+            writes.push([...data]);
+          },
+          read: async () => Buffer.alloc(0),
+          subscribe: async () => {},
+          profile: defaultProfile(),
+          deviceAddress: '',
+          availableChars: new Set<string>(),
+        } as unknown as ConnectionContext;
+        await adapter.onConnected(ctx);
+        writes.length = 0;
+        adapter.onSessionEnd!();
+        // The 2s fallback handshake must not run after the session ended.
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(writes).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   // ── GE CS 10 G "Fit Plus" extended long frame (#235) ────────────────────────
   describe('GE CS 10 G extended long frame (#235)', () => {
     /** Real 20-byte 0x12 from a GE CS 10 G "Fit Plus" (#235). */
@@ -1177,6 +1205,56 @@ describe('AE02 dispatch (#75, #235)', () => {
       const config = writes.find((w) => w[0] === 0x13 && w[4] === 0x10);
       expect(config).toBeDefined();
       expect(config![2]).toBe(0xab);
+    });
+
+    // #235: after START the GE CS 10 G stays silent until the vendor app writes
+    // this frame twice. hedoric's retest on the proto fix proved every other
+    // command already matches the app byte for byte.
+    it('sends the measurement trigger twice after START on the extended dialect', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeExtendedScaleInfo());
+      const startIndex = writes.findIndex((w) => w[0] === 0x22);
+      expect(startIndex).toBeGreaterThanOrEqual(0);
+      const after = writes.slice(startIndex + 1);
+      const triggers = after.filter((w) => w[0] === 0xa2);
+      expect(triggers).toHaveLength(2);
+      for (const t of triggers) {
+        expect(t).toEqual([0xa2, 0x06, 0x01, 0x1e, 0x23, 0xea]);
+        // Self-consistent QN frame: checksum is the low byte of the sum.
+        expect(t[5]).toBe(t.slice(0, 5).reduce((a, b) => a + b, 0) & 0xff);
+      }
+    });
+
+    it('does not send the trigger on the ES-26M dialect', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeEs26mScaleInfo());
+      const startIndex = writes.findIndex((w) => w[0] === 0x22);
+      expect(startIndex).toBeGreaterThanOrEqual(0);
+      expect(writes.slice(startIndex + 1).filter((w) => w[0] === 0xa2)).toHaveLength(0);
+    });
+
+    it('does not send the trigger on the classic dialect', async () => {
+      const adapter = makeAdapter();
+      const info = Buffer.alloc(11);
+      info[0] = 0x12;
+      info[2] = 0xab;
+      info[10] = 1;
+      const writes = await driveHandshake(adapter, info);
+      const startIndex = writes.findIndex((w) => w[0] === 0x22);
+      expect(startIndex).toBeGreaterThanOrEqual(0);
+      expect(writes.slice(startIndex + 1).filter((w) => w[0] === 0xa2)).toHaveLength(0);
+    });
+
+    // The trigger is a different frame from the A2 user profile sent at ready
+    // time, so the profile must still go out exactly once, before START.
+    it('keeps the ready-time A2 user profile distinct from the trigger', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeExtendedScaleInfo());
+      const startIndex = writes.findIndex((w) => w[0] === 0x22);
+      const beforeStart = writes.slice(0, startIndex).filter((w) => w[0] === 0xa2);
+      expect(beforeStart).toHaveLength(1);
+      expect(beforeStart[0][3]).toBe(0x32);
+      expect(beforeStart[0][4]).toBe(30); // defaultProfile age
     });
 
     it('keeps the long-frame impedance grace path on the extended dialect', () => {
