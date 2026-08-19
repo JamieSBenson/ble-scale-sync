@@ -94,7 +94,7 @@ If the log says `Unknown config key '...' in config.yaml`, the option is real bu
 
 If there is no such warning, the option was understood and something else is going on. The `Version` line at the top of the log names the exact build, including the image channel and commit when running a container, which is worth pasting into any issue.
 
-Home Assistant add-on users: installing the repository with `#dev` updates the options UI but **not** the application image. Use the `#addon-dev` repository instead, which builds from the dev image. See [Testing a development build](/guide/home-assistant-addon#testing-a-development-build).
+Home Assistant add-on users: installing the repository with `#dev` updates the options UI but **not** the application image. See [Testing a development build](/guide/home-assistant-addon#testing-a-development-build).
 
 ### My scale is discovered but connection fails. What do I try first?
 
