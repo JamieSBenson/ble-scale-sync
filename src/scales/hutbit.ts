@@ -54,9 +54,16 @@ function frameChecksum(data: Buffer): number {
  * STATUS 0xCE = measuring/unstable and 0xCA = stable/final. Weight = u16 / 10 kg.
  *
  * Decoded from two known-weight HCI snoops (#254): `ac0203490000ca16`
- * = 0x0349 = 841 → 84.1 kg. The unit's bioimpedance is unreliable (it reported
- * 0.4 to 0.7 % body fat), so it is treated as weight-only and body composition is
- * derived via the shared BIA/BMI pipeline, same as the Robi S9 / Renpho adapters.
+ * = 0x0349 = 841 → 84.1 kg. The scale's own DERIVED body-fat frames are useless
+ * (they reported 0.4 to 0.7 %), so this stays weight-only and body composition
+ * comes from the shared BIA/BMI pipeline, same as the Robi S9 / Renpho adapters.
+ *
+ * That is not the same thing as the hardware having no usable sensor, and an
+ * earlier version of this comment conflated the two. @RussH reports (#322) that
+ * on a Juniper-branded unit in the same family, holding the link open past the
+ * stable frame yields `AC 02 FD 01 <impedance_u16_BE> CB <cksum>`, a raw
+ * impedance in ohms that passes this file's own checksum. Decoding it is
+ * tracked in #322 and wants a second, clearly different value first.
  */
 export class HutbitAdapter implements ScaleAdapterCore, GattWiring {
   readonly name = 'Hutbit';
@@ -128,8 +135,8 @@ export class HutbitAdapter implements ScaleAdapterCore, GattWiring {
     if (!(weight > 0) || !Number.isFinite(weight)) return null;
 
     this.final = true;
-    // Weight-only: the sensor's bioimpedance is unreliable, so emit impedance 0
-    // and let the shared BIA/BMI pipeline derive body composition.
+    // Weight-only for now: the scale's derived body-fat frames are useless, and
+    // the raw FD01 impedance frame reported in #322 is not decoded here yet.
     return { weight, impedance: 0 };
   }
 
@@ -138,8 +145,8 @@ export class HutbitAdapter implements ScaleAdapterCore, GattWiring {
   }
 
   computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {
-    // Body composition via the shared BMI/BIA fallback; the vendor's own
-    // bioimpedance is unreliable and its body-comp frames are not decoded.
+    // Body composition via the shared BMI/BIA fallback; the vendor's derived
+    // body-comp frames are useless and its raw impedance is not decoded yet (#322).
     return buildPayload(reading.weight, reading.impedance, {}, profile);
   }
 }
