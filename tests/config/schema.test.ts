@@ -369,6 +369,30 @@ describe('BleSchema', () => {
     expect(result.success).toBe(true);
   });
 
+  // #83: the Beurer BF500 will not run a standalone weigh-in while our session
+  // holds the user context, so a shorter session frees the scale sooner.
+  it('accepts ble.session_timeout_sec within 5 to 600', () => {
+    for (const secs of [5, 20, 600]) {
+      const result = BleSchema.safeParse({ session_timeout_sec: secs });
+      expect(result.success).toBe(true);
+    }
+  });
+
+  it('rejects ble.session_timeout_sec outside 5 to 600', () => {
+    for (const secs of [4, 601]) {
+      expect(BleSchema.safeParse({ session_timeout_sec: secs }).success).toBe(false);
+    }
+  });
+
+  // Documents why src/config/unknown-keys.ts exists: a key this build does not
+  // know is dropped without a word, which is how #318 read as "the option does
+  // nothing" rather than "your build is older than that option".
+  it('silently strips unknown keys under ble, which is why unknown-keys.ts exists', () => {
+    const result = BleSchema.safeParse({ scale_mac: 'AA:BB:CC:DD:EE:FF', not_a_real_key: 1 });
+    expect(result.success).toBe(true);
+    if (result.success) expect('not_a_real_key' in result.data).toBe(false);
+  });
+
   it('rejects handler mqtt-proxy without mqtt_proxy config', () => {
     const result = BleSchema.safeParse({ handler: 'mqtt-proxy' });
     expect(result.success).toBe(false);
