@@ -14,14 +14,19 @@ jobs:
 
     steps:
       - name: Clean up old container images
-        uses: snok/container-retention-policy@v3
+        # Pinned to an exact release: there is no floating v3 tag, so
+        # `@v3` failed to resolve and every scheduled run died at "Set up job".
+        uses: snok/container-retention-policy@v3.1.0
         with:
           account: KristianP26
           token: ${{ secrets.GITHUB_TOKEN }}
           image-names: ble-scale-sync
           cut-off: 30d
           keep-n-most-recent: 10
-          # dev is the channel reporters are asked to test unreleased fixes on,
-          # so a quiet month must not prune it out from under them.
-          skip-tags: "latest|dev|\\d+(\\.\\d+)*"
-          token-type: github-token
+          # v3 selects with image-tags and has no skip-tags. Only the immutable
+          # per-commit dev tags are eligible, so a release image, `latest` and
+          # the rolling `dev` tag can never be pruned by this job. `dev` is the
+          # channel reporters are asked to test unreleased fixes on, and a quiet
+          # month must not remove it from under them.
+          image-tags: "dev-*"
+          tag-selection: tagged

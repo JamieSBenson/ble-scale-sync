@@ -14,7 +14,7 @@ RUN npm run build
 FROM node:22-slim
 
 # OCI labels
-ARG VERSION=dev
+ARG VERSION=local
 ARG BUILD_DATE
 ARG VCS_REF
 LABEL org.opencontainers.image.title="BLE Scale Sync" \
