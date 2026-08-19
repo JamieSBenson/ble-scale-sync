@@ -167,6 +167,22 @@ scale:
     expect(() => loadYamlConfig('/test/config.yaml')).toThrow();
   });
 
+  it('warns about an unknown key under ble and keeps loading (#318)', () => {
+    const yamlWithTypo = VALID_YAML.replace(
+      '  scale_mac:',
+      '  force_scale_adaptr: "Hutbit"\n  scale_mac:',
+    );
+    vi.spyOn(fs, 'readFileSync').mockReturnValue(yamlWithTypo);
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const config = loadYamlConfig('/test/config.yaml');
+
+    expect(config).toBeDefined();
+    expect(warn.mock.calls.flat().join(' ')).toContain('ble.force_scale_adaptr');
+    warn.mockRestore();
+  });
+
   it('warns and skips unknown exporter types', () => {
     const yamlWithUnknown = VALID_YAML.replace('type: garmin', 'type: fakexporter');
     vi.spyOn(fs, 'readFileSync').mockReturnValue(yamlWithUnknown);
