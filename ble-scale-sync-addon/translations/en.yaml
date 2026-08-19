@@ -10,6 +10,7 @@ configuration:
     description: >-
       Linux HCI adapter name (e.g., hci0, hci1).
       Only needed if you have multiple Bluetooth adapters.
+      Leave empty for the system default.
   force_scale_adapter:
     name: Force scale adapter
     description: >-
@@ -18,7 +19,6 @@ configuration:
       (e.g. Hutbit). Requires the scale MAC to be set, because a forced adapter
       claims every device it is shown. Please also report the misdetection so it
       can be fixed for everyone.
-      Leave empty for the system default.
   weight_unit:
     name: Weight unit
     description: >-

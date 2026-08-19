@@ -86,6 +86,16 @@ npm run scan
 
 Step on the scale during the scan so it starts advertising.
 
+### I set an option from the documentation and it does nothing. Why?
+
+Two causes, and the log tells them apart.
+
+If the log says `Unknown config key '...' in config.yaml`, the option is real but your build is older than it. Options are documented as soon as they land on `dev`; update to a release that contains it.
+
+If there is no such warning, the option was understood and something else is going on. The `Version` line at the top of the log names the exact build, including the image channel and commit when running a container, which is worth pasting into any issue.
+
+Home Assistant add-on users: installing the repository with `#dev` updates the options UI but **not** the application image. See [Testing a development build](/guide/home-assistant-addon#testing-a-development-build).
+
 ### My scale is discovered but connection fails. What do I try first?
 
 On Linux, `sudo systemctl restart bluetooth` fixes roughly 80% of transient GATT issues. If failures persist, flip `ble.noble_driver` between `abandonware` and `stoprocent` in `config.yaml`. The full decision tree lives in [Troubleshooting](/troubleshooting).

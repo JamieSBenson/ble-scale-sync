@@ -58,6 +58,7 @@ ble:
   # noble_driver: abandonware
   # adapter: hci1
   # force_scale_adapter: 'Hutbit'
+  # session_timeout_sec: 20
 ```
 
 | Field                 | Required                    | Default        | Description                                                                                                                                                                                          |
@@ -68,6 +69,7 @@ ble:
 | `noble_driver`        | No                          | OS default     | `abandonware` or `stoprocent`. Overrides the default BLE driver. Only applies when `handler: auto`.                                                                                                  |
 | `adapter`             | No                          | System default | Linux only. Select a specific Bluetooth adapter (e.g., `hci0`, `hci1`). See below.                                                                                                                   |
 | `force_scale_adapter` | No                          | Auto-detect    | Name of the scale protocol adapter to use, bypassing auto-detection. Requires `scale_mac`. See below.                                                                                                |
+| `session_timeout_sec` | No                          | `120`          | Seconds one GATT session may wait for a complete reading (5 to 600). Lower it for scales that refuse to weigh while a host holds the session open. See below.                                        |
 | `mqtt_proxy`          | If `handler: mqtt-proxy`    | (none)         | MQTT proxy connection (`broker_url`, `device_id`, `topic_prefix`, `username`, `password`, `auto_connect`, `embedded_broker_*`). See [ESP32 BLE Proxy](./esp32-proxy).                                |
 | `esphome_proxy`       | If `handler: esphome-proxy` | (none)         | ESPHome Native API connection (`host`, `port`, `encryption_key` or `password`, `client_info`). See [ESPHome Bluetooth Proxy](./esphome-proxy).                                                       |
 
@@ -85,6 +87,21 @@ ble:
 Two things to know. The forced adapter claims **every** device it is shown, which is why `scale_mac` is required: the MAC is what keeps it aimed at your scale. And an unknown name fails at startup with the list of valid ones rather than being ignored.
 
 If you need this, please [open an issue](https://github.com/KristianP26/ble-scale-sync/issues) with your scale's advertisement, so detection can be fixed for everyone and you can drop the override.
+:::
+
+::: tip Shortening the session (`session_timeout_sec`)
+Some scales will not run a standalone weigh-in while a host holds the GATT session open. The Beurer BF500 is the clearest example: it displays `APP` and waits, so only a measurement taken **between** sessions is picked up.
+
+By default a session waits 120 seconds for a reading, which on a 30 second cooldown leaves the scale busy about two thirds of the time. Shortening it frees the scale sooner:
+
+```yaml
+ble:
+  session_timeout_sec: 20
+runtime:
+  scan_cooldown: 60
+```
+
+The cost is real: every failed read triggers a Bluetooth adapter reset, so a 20 second session means roughly six times as many resets per hour as the default. Lower it only if your scale actually needs the free window.
 :::
 
 ::: tip BLE adapter selection (Linux only)
@@ -147,6 +164,9 @@ users:
 | `weight_range`      | No       | (none)         | `{ min, max }` in kg. Required for [multi-user](/multi-user) deployments |
 | `last_known_weight` | No       | `null`         | Auto-updated after each measurement                                      |
 | `exporters`         | No       | (none)         | [Per-user exporter](/multi-user#per-user-exporters) overrides            |
+| `beurer_pin`        | Beurer   | (none)         | Consent code the Beurer BF7xx / BF9xx scale was paired with              |
+| `beurer_user_index` | No       | `1`            | Scale user slot the consent code belongs to                             |
+| `beurer_provision`  | No       | `false`        | Write this profile into a Beurer scale that has no stored user           |
 
 ### Exporters
 

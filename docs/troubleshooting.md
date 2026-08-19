@@ -90,6 +90,33 @@ On Linux, `node-ble` is always used regardless of `noble_driver`. The flag only 
 
 If your scale is not being recognized during scan but you know its MAC address, set `scale_mac` in `config.yaml`. The adapter will match post-connect using GATT service UUIDs regardless of the driver.
 
+### Beurer consent code rejected after a battery change
+
+Log line:
+
+```
+Beurer BF720: consent rejected (USER_NOT_AUTHORIZED)
+Beurer BF720: the scale reports no stored user profiles
+```
+
+Removing the batteries from a Beurer BF7xx or BF9xx wipes every user slot **and** its consent code. No code the scale was previously paired with can be correct, because the slot it belonged to no longer exists. The physical sign is that the user-slot digit is gone from the display.
+
+On a scale in that state:
+
+1. Try `users[].beurer_pin: 0`. A scale with no users has no code to check.
+2. Set `users[].beurer_provision: true` so the profile in `config.yaml` (date of birth, gender, height, activity level) is written back into the scale instead of an empty profile being confirmed to it.
+
+```yaml
+users:
+  - name: Alice
+    beurer_pin: 0
+    beurer_provision: true
+```
+
+One caution: on Linux, `beurer_pin` is also the passkey offered to BlueZ during pairing. If the scale is already bonded, remove the bond (`bluetoothctl remove <MAC>`) before changing it.
+
+Provisioning only fills fields the scale reports as empty. A populated profile is written back byte for byte, exactly as before.
+
 ## Exporter Issues
 
 ### Garmin upload fails
