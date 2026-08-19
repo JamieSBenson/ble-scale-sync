@@ -164,7 +164,25 @@ The add-on is a thin layer over a published application image, and `build.yaml` 
 This is exactly the trap in [#318](https://github.com/KristianP26/ble-scale-sync/issues/318): a new option appeared in the UI, was set, and did nothing, because the application inside the container predated it.
 :::
 
-To actually run unreleased application code today, run the plain Docker image outside the Supervisor:
+There are two ways to actually run unreleased application code.
+
+**The dev add-on channel (Home Assistant OS included).** Add this repository instead:
+
+```
+https://github.com/KristianP26/ble-scale-sync#addon-dev
+```
+
+and install **BLE Scale Sync (dev)**. It is the same add-on built from the `:dev` image, on a branch kept separate so it never appears in the store unless you ask for it. It has its own slug, so it installs alongside the stable add-on rather than replacing it.
+
+::: warning Run only one of them at a time
+Both drive the same Bluetooth adapter and will fight over it. Stop the stable add-on before starting the dev one.
+
+Only install this if a maintainer asked you to test something. It runs code that has not been released.
+:::
+
+Home Assistant caches the image it built, so use the add-on's **Rebuild** button to pick up a newer `:dev` build.
+
+**The plain Docker image**, if you have a Docker host:
 
 ```
 ghcr.io/kristianp26/ble-scale-sync:dev
