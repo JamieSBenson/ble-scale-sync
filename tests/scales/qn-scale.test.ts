@@ -1081,4 +1081,122 @@ describe('AE02 dispatch (#75, #235)', () => {
     expect(adapter.parseCharNotification(AE02, notChallenge)).toBeNull();
     vi.restoreAllMocks();
   });
+
+  // ── GE CS 10 G "Fit Plus" extended long frame (#235) ────────────────────────
+  describe('GE CS 10 G extended long frame (#235)', () => {
+    /** Real 20-byte 0x12 from a GE CS 10 G "Fit Plus" (#235). */
+    function makeExtendedScaleInfo(): Buffer {
+      return Buffer.from([
+        0x12, 0x14, 0xff, 0x4e, 0xc7, 0x0e, 0x00, 0x07, 0xff, 0x14, 0x0f, 0x42, 0x00, 0x08, 0x05,
+        0x03, 0xe0, 0x6f, 0x2b, 0x3d,
+      ]);
+    }
+
+    /** Real 18-byte 0x12 from a Renpho ES-26M (45e4d6e). */
+    function makeEs26mScaleInfo(): Buffer {
+      return Buffer.from([
+        0x12, 0x12, 0xff, 0x0f, 0xac, 0x14, 0x00, 0x04, 0xff, 0x0f, 0x07, 0x0a, 0x00, 0x00, 0x05,
+        0x9f, 0x30, 0xe9,
+      ]);
+    }
+
+    /**
+     * Drive the handshake from a 0x12 scale-info frame all the way to the 0x22
+     * START, collecting every write. The 0x14 and 0x21 frames are the ones the
+     * GE CS 10 G actually sends (#235).
+     */
+    async function driveHandshake(adapter: QnScaleAdapter, info: Buffer): Promise<number[][]> {
+      vi.useFakeTimers();
+      try {
+        const writes: number[][] = [];
+        const ctx = {
+          write: async (_uuid: string, data: Buffer | number[]) => {
+            writes.push([...data]);
+          },
+          read: async () => Buffer.alloc(0),
+          subscribe: async () => {},
+          profile: defaultProfile(),
+          deviceAddress: '',
+          availableChars: new Set<string>(),
+        } as unknown as ConnectionContext;
+        await adapter.onConnected(ctx);
+        adapter.parseNotification(info);
+        adapter.parseNotification(
+          Buffer.from([0x14, 0x0c, 0xff, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xfd, 0x1f]),
+        );
+        adapter.parseNotification(Buffer.from([0x21, 0x07, 0xff, 0x01, 0x61, 0x2c, 0xb5]));
+        await vi.advanceTimersByTimeAsync(2000);
+        return writes;
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    it('20B 0x12 frame echoes the protocol type into the 0x13 config', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeExtendedScaleInfo());
+      const config = writes.find((w) => w[0] === 0x13 && w[4] === 0x10);
+      expect(config).toEqual([0x13, 0x09, 0xff, 0x01, 0x10, 0x00, 0x00, 0x00, 0x2c]);
+    });
+
+    it('20B 0x12 frame makes the 0x22 START byte identical to the vendor app', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeExtendedScaleInfo());
+      const start = writes.find((w) => w[0] === 0x22);
+      expect(start).toEqual([0x22, 0x06, 0xff, 0x00, 0x03, 0x2a]);
+    });
+
+    it('20B 0x12 frame echoes the protocol type into the 0x20 time sync', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeExtendedScaleInfo());
+      const timeSync = writes.find((w) => w[0] === 0x20);
+      expect(timeSync).toBeDefined();
+      expect(timeSync![2]).toBe(0xff);
+      // The four time bytes are wall-clock dependent; the checksum is not.
+      expect(timeSync![7]).toBe(timeSync!.slice(0, 7).reduce((a, b) => a + b, 0) & 0xff);
+    });
+
+    // Hardware regression guard for 45e4d6e: on the 18-byte ES-26M frame,
+    // echoing data[2] made the scale reject every command. It must stay 0x00.
+    it('18B 0x12 frame still sends proto 0x00 (ES-26M hardware guard)', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeEs26mScaleInfo());
+      const config = writes.find((w) => w[0] === 0x13 && w[4] === 0x10);
+      expect(config).toEqual([0x13, 0x09, 0x00, 0x01, 0x10, 0x00, 0x00, 0x00, 0x2d]);
+      const start = writes.find((w) => w[0] === 0x22);
+      expect(start).toEqual([0x22, 0x06, 0x00, 0x00, 0x03, 0x2b]);
+    });
+
+    it('classic 11B 0x12 frame is unaffected by the extended-dialect rule', async () => {
+      const adapter = makeAdapter();
+      const info = Buffer.alloc(11);
+      info[0] = 0x12;
+      info[2] = 0xab;
+      info[10] = 1;
+      const writes = await driveHandshake(adapter, info);
+      const config = writes.find((w) => w[0] === 0x13 && w[4] === 0x10);
+      expect(config).toBeDefined();
+      expect(config![2]).toBe(0xab);
+    });
+
+    it('keeps the long-frame impedance grace path on the extended dialect', () => {
+      const adapter = makeAdapter();
+      adapter.parseNotification(makeExtendedScaleInfo());
+      const stableNoImpedance = Buffer.alloc(14);
+      stableNoImpedance[0] = 0x10;
+      stableNoImpedance[1] = 0x0e;
+      stableNoImpedance[2] = 0xff;
+      stableNoImpedance[3] = 0x01;
+      stableNoImpedance[4] = 0x02;
+      stableNoImpedance.writeUInt16BE(9790, 5);
+      // First stable R1=R2=0 frame only starts the grace timer.
+      expect(adapter.parseNotification(stableNoImpedance)).toBeNull();
+      (adapter as unknown as { firstStableNoImpedanceAt: number }).firstStableNoImpedanceAt =
+        Date.now() - 2000;
+      const reading = adapter.parseNotification(stableNoImpedance);
+      expect(reading).not.toBeNull();
+      expect(reading!.weight).toBeCloseTo(97.9);
+      expect(reading!.impedance).toBe(0);
+    });
+  });
 });

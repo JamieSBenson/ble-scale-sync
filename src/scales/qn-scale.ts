@@ -138,6 +138,16 @@ const STORED_QUERY_RETRY_MS = 3000;
  */
 const MAX_AE00_RESPONSES = 3;
 
+/**
+ * Smallest 0x12 scale-info frame that carries a usable vendor protocol type at
+ * byte[2]. The 18-byte Renpho ES-26M frame does not: that hardware was verified
+ * working with proto 0x00 (45e4d6e). The 20-byte GE CS 10 G frame does: the
+ * vendor app echoes its byte[2] (0xff) in 0x13/0x20/0x22 on the same scale, and
+ * the frame carries two extra fields before the checksum, so it is a later
+ * revision of the same layout (#235).
+ */
+const EXTENDED_INFO_FRAME_LEN = 20;
+
 export class QnScaleAdapter
   implements ScaleAdapterCore, GattWiring, BroadcastSource, MultiCharNotify
 {
@@ -208,6 +218,13 @@ export class QnScaleAdapter
    * R1=R2=0 is correct there.
    */
   private isLongFrameVariant = false;
+
+  /**
+   * Whether the 0x12 frame was the 20-byte extended dialect (#235). That
+   * revision keeps a real protocol type at byte[2] and the vendor app echoes
+   * it, unlike the 18-byte ES-26M frame which needs 0x00.
+   */
+  private isExtendedLongFrame = false;
 
   /**
    * Timestamp (Date.now()) of the first stable R1=R2=0 frame seen on a
@@ -319,6 +336,7 @@ export class QnScaleAdapter
     this.ae01Chain = Promise.resolve();
     this.ae00ResponsesSent = 0;
     this.isLongFrameVariant = false;
+    this.isExtendedLongFrame = false;
     this.firstStableNoImpedanceAt = null;
     this.sessionStartedScaleSeconds = Math.floor(Date.now() / 1000) - SCALE_EPOCH_OFFSET;
     this.configSent = false;
@@ -623,17 +641,27 @@ export class QnScaleAdapter
       // MAC address. The classic QN format has ~11 bytes with protocol
       // type at [2] and weight scale flag at [10].
       if (data.length >= 18 && data[1] === data.length) {
-        // Long frame (ES-26M): MAC at [2-7], use proto=0x00
+        // Long frame. Two dialects share this shape and disagree about byte[2]:
+        //   18 bytes (Renpho ES-26M): verified working with proto 0x00 (45e4d6e).
+        //   20 bytes (GE CS 10 G "Fit Plus"): the vendor app echoes data[2] on
+        //     the same hardware, and the frame carries two extra fields before
+        //     the checksum, so it is a later revision of the layout (#235).
         this.isLongFrameVariant = true;
-        this.seenProtocolType = 0x00;
+        this.isExtendedLongFrame = data.length >= EXTENDED_INFO_FRAME_LEN;
+        this.seenProtocolType = this.isExtendedLongFrame ? data[2] : 0x00;
         this.weightScaleFactor = 10;
       } else {
         // Classic short frame
         this.seenProtocolType = data[2];
         this.weightScaleFactor = data[10] === 1 ? 100 : 10;
       }
+      const dialect = this.isExtendedLongFrame
+        ? 'extended'
+        : this.isLongFrameVariant
+          ? 'es26m'
+          : 'classic';
       bleLog.debug(
-        `QN: scale info (${data.length}B), ` +
+        `QN: scale info (${data.length}B, dialect=${dialect}), ` +
           `factor=${this.weightScaleFactor}, ` +
           `proto=0x${this.seenProtocolType.toString(16).padStart(2, '0')}`,
       );
