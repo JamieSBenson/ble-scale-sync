@@ -510,6 +510,46 @@ describe('BeurerBf720Adapter', () => {
       expect(write.mock.calls.map((c) => c[0])).toEqual([CHR_DOB, CHR_DBINC]);
     });
 
+    it('reports the increment outcome in the commit line, even when it is rejected', async () => {
+      // A rejected increment used to throw past the commit line, so a log
+      // missing that line could mean either "the increment failed" or "the
+      // whole sync failed". One line now answers it (#229).
+      const debug = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      const a = makeAdapter();
+      const ctx = bf788Ctx({
+        write: vi.fn(async (uuid: string) => {
+          if (uuid === CHR_DBINC) throw new Error('write not permitted');
+        }),
+      });
+      await a.onConnected(ctx);
+
+      a.parseCharNotification(CHR_UCP, Buffer.from('200201', 'hex'));
+      await flush();
+
+      const commit = debug.mock.calls
+        .map((c) => String(c[0]))
+        .find((line) => line.includes('user profile committed'));
+      expect(commit).toBeDefined();
+      expect(commit).toContain('change increment rejected');
+      debug.mockRestore();
+    });
+
+    it('records the increment as written when the scale accepts it', async () => {
+      const debug = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      const a = makeAdapter();
+      const ctx = bf788Ctx();
+      await a.onConnected(ctx);
+
+      a.parseCharNotification(CHR_UCP, Buffer.from('200201', 'hex'));
+      await flush();
+
+      const commit = debug.mock.calls
+        .map((c) => String(c[0]))
+        .find((line) => line.includes('user profile committed'));
+      expect(commit).toContain('change increment written');
+      debug.mockRestore();
+    });
+
     it('still bumps the increment when one profile write is rejected', async () => {
       // The increment is the step the scale actually waits for, so a read-only
       // vendor characteristic on a sibling model must not cost us it.
