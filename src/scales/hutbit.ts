@@ -4,6 +4,7 @@ import type {
   ConnectionContext,
   ScaleAdapterCore,
   GattWiring,
+  HoldForComposition,
   ScaleReading,
   UserProfile,
   BodyComposition,
@@ -82,6 +83,15 @@ const IMPEDANCE_MAX_OHM = 1200;
  */
 const COMPOSITION_HOLD_MS = 8000;
 
+/**
+ * How long after the settled weight an impedance frame may still be paired with
+ * it. Slightly wider than the hold window, so a frame that arrives just as the
+ * window closes is not thrown away, and narrow enough that two units weighing
+ * at once through one proxy cannot lend each other a weight: this adapter is a
+ * shared singleton and holds one weight, not one per device.
+ */
+const IMPEDANCE_PAIRING_WINDOW_MS = 10_000;
+
 /** Additive checksum over D0..STATUS (bytes 2..6), matching the vendor frames. */
 function frameChecksum(data: Buffer): number {
   return (data[2] + data[3] + data[4] + data[5] + data[6]) & 0xff;
@@ -112,7 +122,7 @@ function frameChecksum(data: Buffer): number {
  * derived body-fat frames stay ignored, because a raw impedance and a wrong
  * body-fat estimate are separate questions and only the first is settled.
  */
-export class HutbitAdapter implements ScaleAdapterCore, GattWiring {
+export class HutbitAdapter implements ScaleAdapterCore, GattWiring, HoldForComposition {
   readonly name = 'Hutbit';
   readonly match: MatchDescriptor = {
     priority: 35,
@@ -142,6 +152,9 @@ export class HutbitAdapter implements ScaleAdapterCore, GattWiring {
    * means one person's impedance against another person's body (#138).
    */
   private lastStableWeight = 0;
+
+  /** When the paired weight was measured, for the pairing window above. */
+  private lastStableAt = 0;
 
   matches(device: BleDeviceInfo): boolean {
     // Branded units advertise "Hutbit Scale". Lefu OEM stock units advertise a
@@ -199,6 +212,7 @@ export class HutbitAdapter implements ScaleAdapterCore, GattWiring {
 
     this.final = true;
     this.lastStableWeight = weight;
+    this.lastStableAt = Date.now();
     // Weight first, impedance second: the scale sends it after the weight has
     // settled, so this reading is complete but not final, and the handler holds
     // the link open for COMPOSITION_HOLD_MS to see whether one arrives.
@@ -238,6 +252,14 @@ export class HutbitAdapter implements ScaleAdapterCore, GattWiring {
       bleLog.debug(`Hutbit: impedance ${impedance} ohm arrived before any stable weight, ignoring`);
       return null;
     }
+    const age = Date.now() - this.lastStableAt;
+    if (age > IMPEDANCE_PAIRING_WINDOW_MS) {
+      bleLog.debug(
+        `Hutbit: impedance ${impedance} ohm arrived ${Math.round(age / 1000)}s after the ` +
+          'weight it would be paired with, ignoring it',
+      );
+      return null;
+    }
 
     bleLog.debug(`Hutbit: impedance ${impedance} ohm (#322)`);
     return { weight: this.lastStableWeight, impedance };
@@ -264,6 +286,7 @@ export class HutbitAdapter implements ScaleAdapterCore, GattWiring {
   private resetSession(): void {
     this.final = false;
     this.lastStableWeight = 0;
+    this.lastStableAt = 0;
   }
 
   computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {

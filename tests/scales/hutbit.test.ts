@@ -286,6 +286,19 @@ describe('HutbitAdapter (#254)', () => {
       expect(adapter.parseNotification(FD01_518)).toBeNull();
     });
 
+    it('does not pair an impedance with a weight from minutes earlier', () => {
+      // The adapter is a shared singleton holding one weight, so two units
+      // weighing through the same proxy must not lend each other a body.
+      vi.useFakeTimers();
+      try {
+        const adapter = weighed();
+        vi.advanceTimersByTime(30_000);
+        expect(adapter.parseNotification(FD01_518)).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('holds the link open for the impedance rather than resolving on the weight', () => {
       expect(makeAdapter().completionHoldMs).toBeGreaterThan(0);
     });
