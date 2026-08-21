@@ -505,7 +505,20 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     if (this.emptyListReported || !this.userListAnswered || this.userSlotsSeen > 0) return;
     // A scale that accepted the consent code is working. Telling that user to
     // switch to beurer_pin 0 would break a setup that reads fine today.
-    if (this.consentAccepted) return;
+    //
+    // The combination is still worth stating plainly, because it is a state the
+    // SIG characteristics cannot show: those read back as fully populated once
+    // provisioning has written them, while the vendor user table stays empty.
+    // A scale that accepts the consent, reports no slot and then never sends a
+    // measurement is in exactly that state (#229).
+    if (this.consentAccepted) {
+      this.emptyListReported = true;
+      bleLog.debug(
+        'Beurer BF720: the consent was accepted but the scale named no stored user slot, ' +
+          'so its vendor user table is empty',
+      );
+      return;
+    }
     this.emptyListReported = true;
     bleLog.warn(
       'Beurer BF720: the scale reports no stored user profiles. Removing the batteries ' +

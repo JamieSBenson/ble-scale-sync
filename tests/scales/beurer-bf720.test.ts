@@ -814,6 +814,22 @@ describe('BeurerBf720Adapter', () => {
       warn.mockRestore();
     });
 
+    it('states plainly that the vendor table is empty when the consent was accepted', () => {
+      // The SIG characteristics read back fully populated once provisioning has
+      // written them, so nothing else in the log distinguishes "this scale has a
+      // user" from "this scale has our values but no slot of its own" (#229).
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const debug = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      const a = makeAdapter();
+      a.parseCharNotification(uuid16(0x2a9f), Buffer.from('200201', 'hex')); // consent accepted
+      a.parseCharNotification(FFF2, Buffer.from('02', 'hex'));
+      expect(debug.mock.calls.flat().join(' ')).toMatch(/named no stored user slot/);
+      // Still no advice to change the PIN: the consent this scale holds works.
+      expect(warn.mock.calls.flat().join(' ')).not.toMatch(EMPTY);
+      warn.mockRestore();
+      debug.mockRestore();
+    });
+
     it('warns only once per session', () => {
       const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
       const a = makeAdapter();
