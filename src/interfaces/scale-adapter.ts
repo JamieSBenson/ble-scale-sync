@@ -145,6 +145,15 @@ export interface AdapterRuntimeConfig {
    * adapters that do not write a unit.
    */
   weightUnit?: WeightUnit;
+  /**
+   * Protocol byte the QN handshake echoes back (`ble.qn_protocol_byte`).
+   *
+   * The value the firmware accepts differs across the family and cannot be
+   * detected: a scale on the wrong byte acknowledges every command and simply
+   * never streams a weight, which looks identical to nobody standing on it.
+   * The frame length picks a default; this overrides it (#75, #331).
+   */
+  qnProtocolByte?: number;
 }
 
 /**

@@ -225,7 +225,98 @@ describe('HutbitAdapter (#254)', () => {
     });
   });
 
+  describe('raw impedance frame (#322)', () => {
+    // The one frame posted with its raw bytes: AC 02 FD 01 02 06 CB D1,
+    // 0x0206 = 518 ohm, and FD+01+02+06+CB = 0x1D1 -> D1, so it passes this
+    // adapter's own checksum.
+    const FD01_518 = Buffer.from('ac02fd010206cbd1', 'hex');
+    const STABLE_841 = Buffer.from('ac0203490000ca16', 'hex');
+
+    function weighed() {
+      const adapter = makeAdapter();
+      parseOk(adapter, STABLE_841, { weight: 84.1, impedance: 0 });
+      return adapter;
+    }
+
+    it('pairs the impedance with the weight this session settled on', () => {
+      const adapter = weighed();
+      const reading = adapter.parseNotification(FD01_518);
+      expect(reading).toEqual({ weight: 84.1, impedance: 518 });
+      expect(adapter.isComplete(reading!)).toBe(true);
+    });
+
+    it('treats the weight-only frame as complete but not final, and the paired one as final', () => {
+      const adapter = makeAdapter();
+      const weightOnly = parseOk(adapter, STABLE_841);
+      expect(adapter.isFinal(weightOnly)).toBe(false);
+      expect(adapter.isFinal(adapter.parseNotification(FD01_518)!)).toBe(true);
+    });
+
+    it('does not mistake its own handshake frame for an impedance', () => {
+      // ac02fde20101ccad is written by this adapter's handshake. It is 8 bytes,
+      // has the AC02 header and passes the checksum, and on the opcode alone it
+      // would decode as a plausible 257 ohm.
+      const adapter = weighed();
+      expect(adapter.parseNotification(Buffer.from('ac02fde20101ccad', 'hex'))).toBeNull();
+    });
+
+    it('ignores the FD 00 frames the scale repeats while it measures', () => {
+      expect(weighed().parseNotification(Buffer.from('ac02fd000000cbc8', 'hex'))).toBeNull();
+    });
+
+    it('ignores the FD FF no-contact sentinel', () => {
+      // A failed contact is not a measurement of zero; it must never reach BIA.
+      expect(weighed().parseNotification(Buffer.from('ac02fdff0000cbc7', 'hex'))).toBeNull();
+    });
+
+    it('ignores an implausible value rather than feeding it to the estimator', () => {
+      // 0x0BB8 = 3000 ohm, checksum valid.
+      expect(weighed().parseNotification(Buffer.from('ac02fd010bb8cb8c', 'hex'))).toBeNull();
+    });
+
+    it('ignores an impedance that arrives before any stable weight', () => {
+      expect(makeAdapter().parseNotification(FD01_518)).toBeNull();
+    });
+
+    it("never pairs an impedance with the previous session's weight", () => {
+      // Adapters are shared singletons: a weigh-in that ends before its
+      // impedance arrives must not lend its weight to the next connection.
+      const adapter = weighed();
+      adapter.onSessionEnd();
+      expect(adapter.parseNotification(FD01_518)).toBeNull();
+    });
+
+    it('does not pair an impedance with a weight from minutes earlier', () => {
+      // The adapter is a shared singleton holding one weight, so two units
+      // weighing through the same proxy must not lend each other a body.
+      vi.useFakeTimers();
+      try {
+        const adapter = weighed();
+        vi.advanceTimersByTime(30_000);
+        expect(adapter.parseNotification(FD01_518)).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('holds the link open for the impedance rather than resolving on the weight', () => {
+      expect(makeAdapter().completionHoldMs).toBeGreaterThan(0);
+    });
+  });
+
   describe('computeMetrics()', () => {
+    it('runs BIA when the raw impedance is present', () => {
+      const adapter = makeAdapter();
+      parseOk(adapter, Buffer.from('ac0203490000ca16', 'hex'));
+      const paired = adapter.parseNotification(Buffer.from('ac02fd010206cbd1', 'hex'))!;
+      const payload = expectValidMetrics(adapter, paired);
+      expect(payload.impedance).toBe(518);
+      // The BMI-only estimate for the same body is a different number, so this
+      // asserts the impedance actually reached the estimator.
+      const bmiOnly = expectValidMetrics(adapter, { weight: 84.1, impedance: 0 });
+      expect(payload.bodyFat).not.toBeCloseTo(bmiOnly.bodyFat!, 1);
+    });
+
     it('derives a valid body-composition payload (weight-only → BIA/BMI)', () => {
       const adapter = makeAdapter();
       const reading = parseOk(adapter, Buffer.from('ac0203490000ca16', 'hex'));

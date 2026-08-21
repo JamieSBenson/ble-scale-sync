@@ -7,7 +7,7 @@ import type {
 import type { EsphomeProxyConfig } from '../../config/schema.js';
 import { type RawReading, waitForRawReading } from '../shared.js';
 import { resolveAdapter } from '../../scales/resolve.js';
-import { evaluateAdvertisement, GraceTimers, DedupWindow } from '../advertisement.js';
+import { evaluateAdvertisement, GraceTimers, DedupWindow, logAdvert } from '../advertisement.js';
 import type { Watcher, WatcherConfig } from '../reading-source.js';
 import { bleLog, errMsg, IMPEDANCE_GRACE_MS } from '../types.js';
 import { AsyncQueue } from '../async-queue.js';
@@ -107,6 +107,7 @@ export class ReadingWatcher implements Watcher {
     const addrLc = address.toLowerCase();
     if (this.targetMac && addrLc !== this.targetMac) return;
 
+    logAdvert(address, info);
     const adapter = resolveAdapter(info, this.adapters);
     if (!adapter) return;
 
@@ -170,11 +171,9 @@ export class ReadingWatcher implements Watcher {
         // the correct char-specific one. On a Eufy P1 "T9147" (fff1 + fff4, no
         // fff2) Inlife matched then failed writing fff2; with the discovered
         // chars, Inlife rejects (no fff2) and 1byone (Eufy) wins on fff4 (#251).
-        gattAdapter =
-          resolveAdapter(
-            { ...info, characteristicUuids: [...session.charMap.keys()] },
-            this.adapters,
-          ) ?? adapter;
+        const discovered = { ...info, characteristicUuids: [...session.charMap.keys()] };
+        logAdvert(address, discovered);
+        gattAdapter = resolveAdapter(discovered, this.adapters) ?? adapter;
         if (gattAdapter.name !== adapter.name) {
           bleLog.info(
             `Re-resolved adapter after GATT discovery: ${adapter.name} -> ${gattAdapter.name} (${address})`,

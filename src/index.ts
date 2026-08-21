@@ -285,7 +285,8 @@ async function main(): Promise<void> {
   // Re-applied on config reload below so a hot-edited key or unit takes effect.
   const applyAdapterConfig = (bindKey: string | undefined): void => {
     const weightUnit = ctx.config.scale.weight_unit;
-    for (const a of adapters) a.configure?.({ bindKey, weightUnit });
+    const qnProtocolByte = ctx.config.ble?.qn_protocol_byte ?? undefined;
+    for (const a of adapters) a.configure?.({ bindKey, weightUnit, qnProtocolByte });
   };
   applyAdapterConfig(ctx.config.ble?.bind_key ?? undefined);
 

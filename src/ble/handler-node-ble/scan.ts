@@ -265,7 +265,7 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
       bleLog.debug(`Found device: ${name} [${mac}]`);
       // Only chance to capture the advertisement: BlueZ drops it (and for some
       // peers the whole Device object) once discovery stops (#297).
-      await logAdvertisementSnapshot(device);
+      const advert = await logAdvertisementSnapshot(device);
 
       // Pre-connection adapter match (by name only). Needed for preferPassive adapters
       // so we can skip the GATT connect entirely and go straight to broadcast scanning.
@@ -328,6 +328,13 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
           localName: name,
           serviceUuids: serviceUuids.map(normalizeUuid),
           characteristicUuids: [...matchCharMap.keys()],
+          // Captured before StopDiscovery, because BlueZ drops the
+          // advertisement with the discovery session. Without it a dozen
+          // adapters that key on a company id (the Lefu OEM fingerprint, the
+          // Xiaomi and Beurer company ids) could never match on Linux, and the
+          // device fell through to whichever adapter claimed the bare vendor
+          // service (#280, #318).
+          ...advert,
         };
         resolved = resolveAdapter(info, adapters);
         if (resolved || attempt === CHAR_DISCOVERY_MAX_RETRIES) break;

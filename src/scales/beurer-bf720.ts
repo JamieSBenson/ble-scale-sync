@@ -409,21 +409,36 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
           this.warnUnsetFieldOnce(field.label);
         }
       }
+      let written = 0;
       for (const [uuid, value] of values) {
         if (session !== this.session) return;
         try {
           await ctx.write(uuid, value, true);
+          written += 1;
         } catch (err) {
           bleLog.debug(`Beurer BF720: profile write ${uuid} rejected: ${String(err)}`);
         }
       }
+      // The increment is the step the scale actually waits for, so its outcome
+      // is reported in the commit line rather than inferred. It also gets its
+      // own try/catch: a rejection here used to throw past the commit line
+      // entirely, so a log without that line and a log with a failed increment
+      // looked identical (#229).
+      let increment = 'absent';
       if (ctx.availableChars.has(CHR_DB_CHANGE_INCREMENT)) {
         if (session !== this.session) return;
-        await ctx.write(CHR_DB_CHANGE_INCREMENT, [0x01, 0x00, 0x00, 0x00], true);
+        try {
+          await ctx.write(CHR_DB_CHANGE_INCREMENT, [0x01, 0x00, 0x00, 0x00], true);
+          increment = 'written';
+        } catch (err) {
+          increment = 'rejected';
+          bleLog.debug(`Beurer BF720: change increment rejected: ${String(err)}`);
+        }
       }
       bleLog.debug(
-        `Beurer BF720: user profile committed (${values.size} characteristics, ` +
-          `${provisioned} written from config); scale can complete the measurement`,
+        `Beurer BF720: user profile committed (${written}/${values.size} characteristics ` +
+          `written, ${provisioned} from config, change increment ${increment}); ` +
+          'scale can complete the measurement',
       );
     } catch (err) {
       // Never fail the reading over this: on firmware that does not need the
@@ -490,7 +505,20 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     if (this.emptyListReported || !this.userListAnswered || this.userSlotsSeen > 0) return;
     // A scale that accepted the consent code is working. Telling that user to
     // switch to beurer_pin 0 would break a setup that reads fine today.
-    if (this.consentAccepted) return;
+    //
+    // The combination is still worth stating plainly, because it is a state the
+    // SIG characteristics cannot show: those read back as fully populated once
+    // provisioning has written them, while the vendor user table stays empty.
+    // A scale that accepts the consent, reports no slot and then never sends a
+    // measurement is in exactly that state (#229).
+    if (this.consentAccepted) {
+      this.emptyListReported = true;
+      bleLog.debug(
+        'Beurer BF720: the consent was accepted but the scale named no stored user slot, ' +
+          'so its vendor user table is empty',
+      );
+      return;
+    }
     this.emptyListReported = true;
     bleLog.warn(
       'Beurer BF720: the scale reports no stored user profiles. Removing the batteries ' +

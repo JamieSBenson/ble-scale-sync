@@ -156,6 +156,20 @@ const MAX_AE00_RESPONSES = 3;
 const EXTENDED_INFO_FRAME_LEN = 20;
 
 /**
+ * Smallest long 0x12 frame whose byte[2] is echoed back on the first attempt.
+ *
+ * Separate from EXTENDED_INFO_FRAME_LEN on purpose: that constant decides which
+ * dialect the scale speaks (and therefore whether the measurement trigger and
+ * the result-frame decode apply), this one decides only which protocol byte to
+ * open with. The 18-byte frame opens with 0x00 because a working unit sits
+ * behind that value; anything longer opens with the echo.
+ */
+const PROTO_ECHO_MIN_INFO_FRAME_LEN = 19;
+
+/** Protocol byte for a long frame whose byte[2] is not echoed back. */
+const LEGACY_PROTO_TYPE = 0x00;
+
+/**
  * Measurement trigger for the extended dialect (#235).
  *
  * On the GE CS 10 G the vendor app writes this frame twice immediately after the
@@ -184,20 +198,33 @@ const TRIGGER_GAP_MS = 150;
  * burst of result frames the adapter had been dropping at the ignore branch, so
  * the handshake succeeded end to end yet nothing ever reached the exporters:
  *
- *   0xB4 .. 04 01 : consolidated result, 44 bytes. Authoritative final weight.
- *       [7-10]  measurement timestamp, LE uint32 (scale 2000-epoch)
- *       [11-12] final weight, LE uint16, /100 kg   (matches the scale display)
- *       [13..]  multi-frequency / segmental impedance channels, LE uint16 each
- *   0xB1 .. 03 01 : first multi-part record, 44 bytes. Fallback weight source.
- *       [5-6]   in-progress weight, LE uint16, /100 kg
+ *   0xB1 .. 03 01 : live sweep record, 44 bytes. THE weight source.
+ *       [5-6]   weight, LE uint16, /100 kg
  *       [7..]   impedance channels
+ *   0xB4 .. 04 01 : stored history record, 44 bytes. Weight only when fresh.
+ *       [7-10]  record timestamp, LE uint32 (scale 2000-epoch)
+ *       [11-12] recorded weight, LE uint16, /100 kg
+ *       [13..]  impedance channels, all zero on a record the scale has not
+ *               finished computing
  *
- * @hedoric hardware-verified both against the scale's own display: weight
- * 75.20 kg, and BMI 20.2 in the 0xB1 03 03 tail, cross-checked as
- * 75.20 / 1.93^2 = 20.19. Every frame carries the standard QN trailing sum
- * checksum. The 0xB4 value is the scale's final averaged weight; the 0xB1 03 01
- * sample reads a few hundred grams high, so 0xB4 is preferred and 0xB1 03 01 is
- * only used when no 0xB4 arrives.
+ * The 0xB4 was originally read as the authoritative final weight. It is not: it
+ * is a HISTORY record, and the timestamp at [7] proves it. In @hedoric's own
+ * three-connect log the first connect's 0xB4 carries 67.10 kg stamped six days
+ * earlier with an all-zero impedance body, while the 0xB1 in the same burst
+ * carries the live 75.25 kg; the third connect's 0xB4 is stamped 178 seconds
+ * before the session began, which is the PREVIOUS connect's weigh-in. Preferring
+ * 0xB4 therefore publishes a stale weight, and on that first connect it would
+ * have exported 67.10 kg to Garmin for a 75 kg user. The middle connect sends no
+ * 0xB4 at all, so 0xB1 is not a fallback in any case: it is the live value.
+ *
+ * The 0xB4 is still accepted when its timestamp is inside the same freshness
+ * window the 0x23 stored records use, since a genuinely current record is the
+ * scale's own averaged figure. Anything older is left to the stored-record path,
+ * which exists for exactly that.
+ *
+ * @hedoric hardware-verified the live values against the scale's own display:
+ * 75.20 kg, BMI 20.2 in the 0xB1 03 03 tail, cross-checked as
+ * 75.20 / 1.93^2 = 20.19. Every frame carries the standard QN trailing sum.
  *
  * Impedance is deliberately NOT forwarded to the BIA estimator yet. The channels
  * are a proprietary multi-frequency segmental sweep in raw units (~2,300-3,050),
@@ -207,6 +234,13 @@ const TRIGGER_GAP_MS = 150;
  * composition falls back to the same profile-based estimate broadcast-only
  * scales already use. Weight and BMI are the parts this decode is sure of.
  */
+/**
+ * How far before the session's start a 0xB4 record may be stamped and still
+ * count as this weigh-in. Covers clock offset between the scale and the host,
+ * nothing more: anything genuinely earlier is a previous measurement.
+ */
+const RESULT_RECORD_CLOCK_TOLERANCE_SEC = 10;
+
 const RESULT_OPCODE_B4 = 0xb4;
 const RESULT_OPCODE_B1 = 0xb1;
 const RESULT_MIN_WEIGHT_KG = 5;
@@ -291,6 +325,17 @@ export class QnScaleAdapter
   private isExtendedLongFrame = false;
 
   /**
+   * Protocol byte forced by `ble.qn_protocol_byte`, overriding what the frame
+   * length implies (#75, #331).
+   *
+   * There is no way to detect the wrong choice at runtime: a scale on the wrong
+   * byte acknowledges 0x14, 0x21 and 0x23 exactly as it does on the right one
+   * and simply never streams a weight, which is indistinguishable from nobody
+   * standing on it. So this is a setting, not a heuristic.
+   */
+  private forcedProtocolType: number | null = null;
+
+  /**
    * Whether a completed-weigh-in result frame (0xB4/0xB1) has already produced a
    * reading this session. The scale repeats the 0xB4 frame ~3x and then sends
    * the 0xB1 records, all describing the one weigh-in, so the reading is emitted
@@ -329,6 +374,7 @@ export class QnScaleAdapter
   /** Receive the configured display unit from the composition root (#269). */
   configure(opts: AdapterRuntimeConfig): void {
     if (opts.weightUnit) this.displayUnit = opts.weightUnit;
+    this.forcedProtocolType = opts.qnProtocolByte ?? null;
   }
 
   /** 0x13 config unit flag: 0x01 kg, 0x02 lb (openScale QNHandler). */
@@ -714,14 +760,26 @@ export class QnScaleAdapter
       // MAC address. The classic QN format has ~11 bytes with protocol
       // type at [2] and weight scale flag at [10].
       if (data.length >= 18 && data[1] === data.length) {
-        // Long frame. Two dialects share this shape and disagree about byte[2]:
-        //   18 bytes (Renpho ES-26M): verified working with proto 0x00 (45e4d6e).
-        //   20 bytes (GE CS 10 G "Fit Plus"): the vendor app echoes data[2] on
-        //     the same hardware, and the frame carries two extra fields before
-        //     the checksum, so it is a later revision of the layout (#235).
+        // Long frame. Every captured one carries 0xff at byte[2] whatever its
+        // length, and the disagreement is over what the firmware ACCEPTS BACK:
+        //   18 bytes (Renpho ES-26M / ES-CS20M): 0x00, which has a working
+        //     unit behind it (45e4d6e). The only vendor-app capture of this
+        //     length drives the scale end to end on 0xff instead (#84), so the
+        //     value is genuinely in doubt for this length and `qn_protocol_byte`
+        //     exists to try the other one without a rebuild.
+        //   19 bytes (Arboleaf): the echo. 0x00 is what the adapter has always
+        //     sent and two reporters get a complete handshake followed by
+        //     silence (#75, #331).
+        //   20 bytes (GE CS 10 G "Fit Plus"): the echo, hardware confirmed on
+        //     the same unit the vendor app was captured from (#235).
+        //
+        // The choice cannot be corrected at runtime: a scale on the wrong byte
+        // acknowledges everything and stays silent, which is exactly what a
+        // scale nobody is standing on does.
         this.isLongFrameVariant = true;
         this.isExtendedLongFrame = data.length >= EXTENDED_INFO_FRAME_LEN;
-        this.seenProtocolType = this.isExtendedLongFrame ? data[2] : 0x00;
+        const byLength = data.length >= PROTO_ECHO_MIN_INFO_FRAME_LEN ? data[2] : LEGACY_PROTO_TYPE;
+        this.seenProtocolType = this.forcedProtocolType ?? byLength;
         this.weightScaleFactor = 10;
       } else {
         // Classic short frame
@@ -922,15 +980,37 @@ export class QnScaleAdapter
     if (sum !== data[data.length - 1]) return null;
 
     let rawWeight: number | null = null;
-    if (data[0] === RESULT_OPCODE_B4 && data.length >= 13 && data[2] === 0x04 && data[3] === 0x01) {
-      rawWeight = data.readUInt16LE(11);
+    if (data[0] === RESULT_OPCODE_B1 && data.length >= 7 && data[2] === 0x03 && data[3] === 0x01) {
+      // Live sweep record.
+      rawWeight = data.readUInt16LE(5);
     } else if (
-      data[0] === RESULT_OPCODE_B1 &&
-      data.length >= 7 &&
-      data[2] === 0x03 &&
+      data[0] === RESULT_OPCODE_B4 &&
+      data.length >= 13 &&
+      data[2] === 0x04 &&
       data[3] === 0x01
     ) {
-      rawWeight = data.readUInt16LE(5);
+      // History record: usable only when it was written DURING this session.
+      //
+      // Deliberately stricter than the 0x23 stored-record window, which accepts
+      // a record from the minute or so before the connect. These scales keep
+      // advertising for a while after a weigh-in, so a proxy transport
+      // reconnects seconds later and finds the just-finished measurement still
+      // sitting in history; a backward-looking window would republish it as a
+      // second weigh-in. A record stamped after the session opened can only be
+      // the one being taken now. The tolerance absorbs the offset between the
+      // scale's clock and ours, which the 0x20 time sync sets each session.
+      const recordSeconds = data.readUInt32LE(7);
+      const sessionSeconds =
+        this.sessionStartedScaleSeconds ?? Math.floor(Date.now() / 1000) - SCALE_EPOCH_OFFSET;
+      if (recordSeconds + RESULT_RECORD_CLOCK_TOLERANCE_SEC < sessionSeconds) {
+        bleLog.debug(
+          `QN: ignoring 0xB4 history record (${data.readUInt16LE(11) / 100}kg, written ` +
+            `${sessionSeconds - recordSeconds}s before this session began); ` +
+            'waiting for the live 0xB1 #235',
+        );
+        return null;
+      }
+      rawWeight = data.readUInt16LE(11);
     }
     if (rawWeight === null) return null;
 
@@ -1069,6 +1149,7 @@ export class QnScaleAdapter
       clearTimeout(this.storedRetryTimer);
       this.storedRetryTimer = null;
     }
+    this.sessionStartedScaleSeconds = null;
     this.ctx = null;
   }
 

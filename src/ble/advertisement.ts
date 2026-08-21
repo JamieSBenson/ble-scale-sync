@@ -1,5 +1,7 @@
 import type { ScaleAdapter, ScaleReading, BleDeviceInfo } from '../interfaces/scale-adapter.js';
 import { hasParseableBroadcastSource, type RawReading } from './shared.js';
+import { bleLog, normalizeUuid, BT_BASE_UUID_SUFFIX } from './types.js';
+import { isDebugEnabled } from '../logger.js';
 
 // ─── Advertisement decision (pure) ─────────────────────────────────────────────
 
@@ -187,4 +189,113 @@ export class DedupWindow {
       if (now - ts >= this.windowMs) this.seen.delete(key);
     }
   }
+}
+
+// ─── Advertisement logging (diagnostics) ───────────────────────────────────────
+
+/** How many UUIDs of one kind are printed before the rest are summarised. */
+const UUID_LIST_CAP = 10;
+/** How many advertisement bytes of one blob are printed. */
+const DATA_BYTE_CAP = 24;
+
+/** Print the 16-bit short form for SIG-base UUIDs, the full form otherwise. */
+function shortUuid(uuid: string): string {
+  const normalized = normalizeUuid(uuid);
+  if (
+    normalized.length === 32 &&
+    normalized.startsWith('0000') &&
+    normalized.endsWith(BT_BASE_UUID_SUFFIX)
+  )
+    return normalized.slice(4, 8);
+  return normalized;
+}
+
+function uuidList(uuids: string[]): string {
+  const shown = uuids.slice(0, UUID_LIST_CAP).map(shortUuid);
+  const rest = uuids.length - shown.length;
+  return `[${shown.join(', ')}${rest > 0 ? `, +${rest} more` : ''}]`;
+}
+
+function blob(data: Buffer): string {
+  const hex = data.subarray(0, DATA_BYTE_CAP).toString('hex');
+  return data.length > DATA_BYTE_CAP ? `${hex}… (${data.length}B)` : hex;
+}
+
+/**
+ * One-line summary of everything an adapter's `matches()` is allowed to see.
+ *
+ * Adapter mis-routing was the root cause of #317, #318 and #319, and every one
+ * of those was reported over a proxy transport. Reproducing the decision from a
+ * pasted log needs the exact inputs, so this prints the whole `BleDeviceInfo`
+ * rather than a summary of it.
+ *
+ * The address is passed separately because `BleDeviceInfo` deliberately does not
+ * carry one: matching is on advertised content, never on who sent it.
+ */
+export function formatAdvert(address: string, info: BleDeviceInfo): string {
+  // Canonical uppercase form: the transports hand addresses over in different
+  // cases, and the same device has to produce the same line for the dedup below
+  // to mean anything.
+  const parts = [
+    `[${address.toUpperCase()}]`,
+    `name=${info.localName ? `"${info.localName}"` : '(none)'}`,
+  ];
+  parts.push(`uuids=${uuidList(info.serviceUuids)}`);
+  if (info.manufacturerData) {
+    const id = info.manufacturerData.id.toString(16).padStart(4, '0');
+    parts.push(`manufacturerData={0x${id}: ${blob(info.manufacturerData.data)}}`);
+  }
+  if (info.serviceData && info.serviceData.length > 0) {
+    const entries = info.serviceData.map((e) => `${shortUuid(e.uuid)}: ${blob(e.data)}`);
+    parts.push(`serviceData={${entries.join(', ')}}`);
+  }
+  if (info.characteristicUuids) parts.push(`chars=${uuidList(info.characteristicUuids)}`);
+  return `Advert: ${parts.join(' ')}`;
+}
+
+/**
+ * Per-address cache of the last advert line printed, so a scan that re-reads the
+ * same advertisement several times a second logs it once. A changed
+ * fingerprint (a scan response filling in the name, or post-discovery
+ * characteristics arriving) prints again, which is the interesting case.
+ */
+const lastAdvertLine = new Map<string, string>();
+
+/**
+ * Cap on remembered addresses. Devices using resolvable private addresses
+ * rotate theirs every few minutes, and a watcher runs for weeks, so an
+ * unbounded map is a slow leak on the smallest supported host. Oldest entry
+ * out, same as the other caches on this path.
+ */
+const ADVERT_CACHE_MAX = 64;
+
+/**
+ * Log an advertisement once per distinct content, on any transport.
+ *
+ * The node-ble handler has its own richer version built from D-Bus properties
+ * (address type and advertising flags, which no other transport exposes); this
+ * is the equivalent for the proxy transports, which previously logged nothing a
+ * reporter could paste. Both use the same `Advert:` prefix on purpose, so one
+ * grep works whatever the transport, and both spell out their fields as
+ * `key=value` so a line is self-describing.
+ */
+export function logAdvert(address: string, info: BleDeviceInfo): void {
+  // Checked before the line is built, not after: this runs on every
+  // advertisement of every device in range, and formatting one is the whole
+  // cost. The node-ble handler guards its sibling line the same way.
+  if (!isDebugEnabled()) return;
+  const key = address.toLowerCase();
+  const line = formatAdvert(address, info);
+  if (lastAdvertLine.get(key) === line) return;
+  if (!lastAdvertLine.has(key) && lastAdvertLine.size >= ADVERT_CACHE_MAX) {
+    const oldest = lastAdvertLine.keys().next().value;
+    if (oldest !== undefined) lastAdvertLine.delete(oldest);
+  }
+  lastAdvertLine.set(key, line);
+  bleLog.debug(line);
+}
+
+/** Test seam: forget every remembered advert line. */
+export function _resetAdvertLog(): void {
+  lastAdvertLine.clear();
 }

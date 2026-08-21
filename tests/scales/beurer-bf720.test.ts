@@ -510,6 +510,46 @@ describe('BeurerBf720Adapter', () => {
       expect(write.mock.calls.map((c) => c[0])).toEqual([CHR_DOB, CHR_DBINC]);
     });
 
+    it('reports the increment outcome in the commit line, even when it is rejected', async () => {
+      // A rejected increment used to throw past the commit line, so a log
+      // missing that line could mean either "the increment failed" or "the
+      // whole sync failed". One line now answers it (#229).
+      const debug = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      const a = makeAdapter();
+      const ctx = bf788Ctx({
+        write: vi.fn(async (uuid: string) => {
+          if (uuid === CHR_DBINC) throw new Error('write not permitted');
+        }),
+      });
+      await a.onConnected(ctx);
+
+      a.parseCharNotification(CHR_UCP, Buffer.from('200201', 'hex'));
+      await flush();
+
+      const commit = debug.mock.calls
+        .map((c) => String(c[0]))
+        .find((line) => line.includes('user profile committed'));
+      expect(commit).toBeDefined();
+      expect(commit).toContain('change increment rejected');
+      debug.mockRestore();
+    });
+
+    it('records the increment as written when the scale accepts it', async () => {
+      const debug = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      const a = makeAdapter();
+      const ctx = bf788Ctx();
+      await a.onConnected(ctx);
+
+      a.parseCharNotification(CHR_UCP, Buffer.from('200201', 'hex'));
+      await flush();
+
+      const commit = debug.mock.calls
+        .map((c) => String(c[0]))
+        .find((line) => line.includes('user profile committed'));
+      expect(commit).toContain('change increment written');
+      debug.mockRestore();
+    });
+
     it('still bumps the increment when one profile write is rejected', async () => {
       // The increment is the step the scale actually waits for, so a read-only
       // vendor characteristic on a sibling model must not cost us it.
@@ -772,6 +812,22 @@ describe('BeurerBf720Adapter', () => {
       expect(a.parseCharNotification(FFF2, Buffer.alloc(0))).toBeNull();
       expect(warn.mock.calls.flat().join(' ')).not.toMatch(EMPTY);
       warn.mockRestore();
+    });
+
+    it('states plainly that the vendor table is empty when the consent was accepted', () => {
+      // The SIG characteristics read back fully populated once provisioning has
+      // written them, so nothing else in the log distinguishes "this scale has a
+      // user" from "this scale has our values but no slot of its own" (#229).
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const debug = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      const a = makeAdapter();
+      a.parseCharNotification(uuid16(0x2a9f), Buffer.from('200201', 'hex')); // consent accepted
+      a.parseCharNotification(FFF2, Buffer.from('02', 'hex'));
+      expect(debug.mock.calls.flat().join(' ')).toMatch(/named no stored user slot/);
+      // Still no advice to change the PIN: the consent this scale holds works.
+      expect(warn.mock.calls.flat().join(' ')).not.toMatch(EMPTY);
+      warn.mockRestore();
+      debug.mockRestore();
     });
 
     it('warns only once per session', () => {

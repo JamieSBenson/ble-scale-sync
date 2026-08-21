@@ -293,14 +293,50 @@ describe('logAdvertisementSnapshot() (#297)', () => {
         AdvertisingFlags: new Error('No such property'),
       }),
     };
-    await expect(logAdvertisementSnapshot(device as never)).resolves.toBeUndefined();
+    await expect(logAdvertisementSnapshot(device as never)).resolves.toEqual({
+      manufacturerData: undefined,
+      serviceData: undefined,
+    });
   });
 
-  it('reads nothing at all when debug logging is off', async () => {
+  it('returns the manufacturer data in the shape adapters match on (#280)', async () => {
+    // A dozen adapters key on a company id. This is the only window in which
+    // BlueZ still holds the advertisement, so what is not captured here can
+    // never reach an adapter on Linux.
+    const device = {
+      helper: makeHelper({
+        ManufacturerData: { 684: Buffer.from('12a291ecb303', 'hex') },
+        ServiceData: { '0000181d-0000-1000-8000-00805f9b34fb': Buffer.from([0x01]) },
+      }),
+    };
+    const advert = await logAdvertisementSnapshot(device as never);
+    expect(advert.manufacturerData).toEqual({
+      id: 0x02ac,
+      data: Buffer.from('12a291ecb303', 'hex'),
+    });
+    expect(advert.serviceData).toEqual([
+      { uuid: '0000181d-0000-1000-8000-00805f9b34fb', data: Buffer.from([0x01]) },
+    ]);
+  });
+
+  it('reads the advertisement even when debug logging is off', async () => {
+    // Adapter selection must not depend on the log level: this used to return
+    // before reading anything unless debug happened to be on (#280, #318).
     setLogLevel(LogLevel.INFO);
-    const helper = makeHelper({ UUIDs: ['0000181d-0000-1000-8000-00805f9b34fb'] });
-    await logAdvertisementSnapshot({ helper } as never);
-    expect(helper.prop).not.toHaveBeenCalled();
+    const helper = makeHelper({ ManufacturerData: { 684: Buffer.from('12a291ecb303', 'hex') } });
+    const advert = await logAdvertisementSnapshot({ helper } as never);
+    expect(helper.prop).toHaveBeenCalled();
+    expect(advert.manufacturerData?.id).toBe(0x02ac);
+    setLogLevel(LogLevel.DEBUG);
+  });
+
+  it('does not log the Advert line when debug logging is off', async () => {
+    setLogLevel(LogLevel.INFO);
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await logAdvertisementSnapshot({ helper: makeHelper({ AddressType: 'public' }) } as never);
+    expect(
+      spy.mock.calls.map((c) => String(c[0])).find((l) => l.includes('Advert:')),
+    ).toBeUndefined();
     setLogLevel(LogLevel.DEBUG);
   });
 });

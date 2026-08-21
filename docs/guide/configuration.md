@@ -59,6 +59,7 @@ ble:
   # adapter: hci1
   # force_scale_adapter: 'Hutbit'
   # session_timeout_sec: 20
+  # qn_protocol_byte: 0
 ```
 
 | Field                 | Required                    | Default        | Description                                                                                                                                                                                          |
@@ -70,6 +71,7 @@ ble:
 | `adapter`             | No                          | System default | Linux only. Select a specific Bluetooth adapter (e.g., `hci0`, `hci1`). See below.                                                                                                                   |
 | `force_scale_adapter` | No                          | Auto-detect    | Name of the scale protocol adapter to use, bypassing auto-detection. Requires `scale_mac`. See below.                                                                                                |
 | `session_timeout_sec` | No                          | `120`          | Seconds one GATT session may wait for a complete reading (5 to 600). Native BLE handlers only; ignored on `mqtt-proxy` and `esphome-proxy`. See below.                                               |
+| `qn_protocol_byte`    | No                          | Auto           | QN-family scales only. Protocol byte the handshake echoes back to the scale (0 to 255). Set it only when a QN scale runs the whole handshake and then reports nothing. See below.                    |
 | `mqtt_proxy`          | If `handler: mqtt-proxy`    | (none)         | MQTT proxy connection (`broker_url`, `device_id`, `topic_prefix`, `username`, `password`, `auto_connect`, `embedded_broker_*`). See [ESP32 BLE Proxy](./esp32-proxy).                                |
 | `esphome_proxy`       | If `handler: esphome-proxy` | (none)         | ESPHome Native API connection (`host`, `port`, `encryption_key` or `password`, `client_info`). See [ESPHome Bluetooth Proxy](./esphome-proxy).                                                       |
 
@@ -87,6 +89,27 @@ ble:
 Two things to know. The forced adapter claims **every** device it is shown, which is why `scale_mac` is required: the MAC is what keeps it aimed at your scale. And an unknown name fails at startup with the list of valid ones rather than being ignored.
 
 If you need this, please [open an issue](https://github.com/KristianP26/ble-scale-sync/issues) with your scale's advertisement, so detection can be fixed for everyone and you can drop the override.
+:::
+
+::: tip QN scales that connect but never send a weight (`qn_protocol_byte`)
+
+The QN protocol family (Renpho, Arboleaf, FITINDEX, GE and several rebadges) echoes a protocol byte back to the scale in every configuration command, and the firmware revisions disagree about which value they accept. The wrong value is not an error: the scale acknowledges the entire handshake and then simply never streams a weight, which looks exactly like nobody standing on it.
+
+The scale-info frame length picks the default, and it is right for every unit reported so far. If your QN scale connects, completes the handshake in the debug log and then goes quiet, try the other value:
+
+```yaml
+ble:
+  qn_protocol_byte: 0 # or 255
+```
+
+The debug log states which value is in use:
+
+```
+QN: scale info (19B, dialect=es26m), factor=10, proto=0xff
+```
+
+If one of the two makes your scale work, please say so in an issue with the model and that line: the default is set from the models we have evidence for, and yours may change it.
+
 :::
 
 ::: tip Shortening the session (`session_timeout_sec`)

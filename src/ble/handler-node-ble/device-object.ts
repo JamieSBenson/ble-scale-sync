@@ -37,16 +37,33 @@ export function isDeviceObjectGone(err: unknown): boolean {
 }
 
 /**
- * Log the advertised payload of a freshly discovered device at debug level.
+ * What a freshly discovered device advertised, in the shape adapters match on.
+ *
+ * BlueZ exposes a dict of company id to payload; `BleDeviceInfo` carries one
+ * entry, matching every other transport. Scales advertise a single company id,
+ * so the first entry is taken and a device with several is not a scale.
+ */
+export interface AdvertisementSnapshot {
+  manufacturerData?: { id: number; data: Buffer };
+  serviceData?: Array<{ uuid: string; data: Buffer }>;
+}
+
+/**
+ * Read (and at debug level log) the advertised payload of a freshly discovered
+ * device.
  *
  * This is the only window in which BlueZ still holds the advertisement for a
  * peer whose Device object does not survive `StopDiscovery`, and it is what
  * identifies a scale as, say, a Tuya 0xFD50 device that will never accept a
  * GATT connection (#266, #297). Never throws: every property is Optional on
  * org.bluez.Device1.
+ *
+ * The read is NOT conditional on debug logging. Adapters match on manufacturer
+ * data (the Lefu OEM fingerprint, the Xiaomi and Beurer company ids, and a
+ * dozen others), and reading it only when someone happened to turn debug on
+ * would make adapter selection depend on the log level.
  */
-export async function logAdvertisementSnapshot(device: Device): Promise<void> {
-  if (!isDebugEnabled()) return;
+export async function logAdvertisementSnapshot(device: Device): Promise<AdvertisementSnapshot> {
   const helper = helperOf(device);
   const read = async (name: string): Promise<unknown> => {
     try {
@@ -85,7 +102,44 @@ export async function logAdvertisementSnapshot(device: Device): Promise<void> {
   const md = dict(manufacturerData, (k) => `0x${Number(k).toString(16).padStart(4, '0')}`);
   if (md) parts.push(`manufacturerData=${md}`);
 
-  bleLog.debug(
-    `Advert: ${parts.length > 0 ? parts.join(' ') : 'no advertised properties exposed'}`,
-  );
+  if (isDebugEnabled()) {
+    bleLog.debug(
+      `Advert: ${parts.length > 0 ? parts.join(' ') : 'no advertised properties exposed'}`,
+    );
+  }
+
+  return {
+    manufacturerData: firstDbusEntry(manufacturerData, (k) => Number(k)),
+    serviceData: allDbusEntries(serviceData),
+  };
+}
+
+/** Unwrap a BlueZ `{key: bytes}` dict into its first usable entry. */
+function firstDbusEntry(
+  val: unknown,
+  keyOf: (k: string) => number,
+): { id: number; data: Buffer } | undefined {
+  for (const [k, v] of dbusEntries(val)) {
+    const bytes = extractDbusBytes(v);
+    const id = keyOf(k);
+    if (bytes && Number.isFinite(id)) return { id, data: bytes };
+  }
+  return undefined;
+}
+
+/** Unwrap a BlueZ `{uuid: bytes}` dict into every usable entry. */
+function allDbusEntries(val: unknown): Array<{ uuid: string; data: Buffer }> | undefined {
+  const out: Array<{ uuid: string; data: Buffer }> = [];
+  for (const [k, v] of dbusEntries(val)) {
+    const bytes = extractDbusBytes(v);
+    if (bytes) out.push({ uuid: k, data: bytes });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/** dbus-next hands dicts back as a Map on some versions and a plain object on others. */
+function dbusEntries(val: unknown): Array<[string, unknown]> {
+  if (!val || typeof val !== 'object') return [];
+  const entries = val instanceof Map ? [...val.entries()] : Object.entries(val);
+  return entries.map(([k, v]) => [String(k), v]);
 }
