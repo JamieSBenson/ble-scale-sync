@@ -184,20 +184,33 @@ const TRIGGER_GAP_MS = 150;
  * burst of result frames the adapter had been dropping at the ignore branch, so
  * the handshake succeeded end to end yet nothing ever reached the exporters:
  *
- *   0xB4 .. 04 01 : consolidated result, 44 bytes. Authoritative final weight.
- *       [7-10]  measurement timestamp, LE uint32 (scale 2000-epoch)
- *       [11-12] final weight, LE uint16, /100 kg   (matches the scale display)
- *       [13..]  multi-frequency / segmental impedance channels, LE uint16 each
- *   0xB1 .. 03 01 : first multi-part record, 44 bytes. Fallback weight source.
- *       [5-6]   in-progress weight, LE uint16, /100 kg
+ *   0xB1 .. 03 01 : live sweep record, 44 bytes. THE weight source.
+ *       [5-6]   weight, LE uint16, /100 kg
  *       [7..]   impedance channels
+ *   0xB4 .. 04 01 : stored history record, 44 bytes. Weight only when fresh.
+ *       [7-10]  record timestamp, LE uint32 (scale 2000-epoch)
+ *       [11-12] recorded weight, LE uint16, /100 kg
+ *       [13..]  impedance channels, all zero on a record the scale has not
+ *               finished computing
  *
- * @hedoric hardware-verified both against the scale's own display: weight
- * 75.20 kg, and BMI 20.2 in the 0xB1 03 03 tail, cross-checked as
- * 75.20 / 1.93^2 = 20.19. Every frame carries the standard QN trailing sum
- * checksum. The 0xB4 value is the scale's final averaged weight; the 0xB1 03 01
- * sample reads a few hundred grams high, so 0xB4 is preferred and 0xB1 03 01 is
- * only used when no 0xB4 arrives.
+ * The 0xB4 was originally read as the authoritative final weight. It is not: it
+ * is a HISTORY record, and the timestamp at [7] proves it. In @hedoric's own
+ * three-connect log the first connect's 0xB4 carries 67.10 kg stamped six days
+ * earlier with an all-zero impedance body, while the 0xB1 in the same burst
+ * carries the live 75.25 kg; the third connect's 0xB4 is stamped 178 seconds
+ * before the session began, which is the PREVIOUS connect's weigh-in. Preferring
+ * 0xB4 therefore publishes a stale weight, and on that first connect it would
+ * have exported 67.10 kg to Garmin for a 75 kg user. The middle connect sends no
+ * 0xB4 at all, so 0xB1 is not a fallback in any case: it is the live value.
+ *
+ * The 0xB4 is still accepted when its timestamp is inside the same freshness
+ * window the 0x23 stored records use, since a genuinely current record is the
+ * scale's own averaged figure. Anything older is left to the stored-record path,
+ * which exists for exactly that.
+ *
+ * @hedoric hardware-verified the live values against the scale's own display:
+ * 75.20 kg, BMI 20.2 in the 0xB1 03 03 tail, cross-checked as
+ * 75.20 / 1.93^2 = 20.19. Every frame carries the standard QN trailing sum.
  *
  * Impedance is deliberately NOT forwarded to the BIA estimator yet. The channels
  * are a proprietary multi-frequency segmental sweep in raw units (~2,300-3,050),
@@ -922,15 +935,30 @@ export class QnScaleAdapter
     if (sum !== data[data.length - 1]) return null;
 
     let rawWeight: number | null = null;
-    if (data[0] === RESULT_OPCODE_B4 && data.length >= 13 && data[2] === 0x04 && data[3] === 0x01) {
-      rawWeight = data.readUInt16LE(11);
+    if (data[0] === RESULT_OPCODE_B1 && data.length >= 7 && data[2] === 0x03 && data[3] === 0x01) {
+      // Live sweep record.
+      rawWeight = data.readUInt16LE(5);
     } else if (
-      data[0] === RESULT_OPCODE_B1 &&
-      data.length >= 7 &&
-      data[2] === 0x03 &&
+      data[0] === RESULT_OPCODE_B4 &&
+      data.length >= 13 &&
+      data[2] === 0x04 &&
       data[3] === 0x01
     ) {
-      rawWeight = data.readUInt16LE(5);
+      // History record: usable only while it describes this weigh-in. The same
+      // window and the same reference clock as the 0x23 stored records, so a
+      // scale that reports history and a scale that reports a fresh result are
+      // judged by one rule rather than two.
+      const recordSeconds = data.readUInt32LE(7);
+      const sessionSeconds =
+        this.sessionStartedScaleSeconds ?? Math.floor(Date.now() / 1000) - SCALE_EPOCH_OFFSET;
+      if (recordSeconds + MAX_STORED_RECORD_AGE_SEC < sessionSeconds) {
+        bleLog.debug(
+          `QN: ignoring stale 0xB4 history record (${data.readUInt16LE(11) / 100}kg, ` +
+            `${sessionSeconds - recordSeconds}s before this session) #235`,
+        );
+        return null;
+      }
+      rawWeight = data.readUInt16LE(11);
     }
     if (rawWeight === null) return null;
 
