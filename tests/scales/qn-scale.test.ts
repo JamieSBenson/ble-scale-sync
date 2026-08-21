@@ -1332,6 +1332,68 @@ describe('AE02 dispatch (#75, #235)', () => {
       expect(start).toEqual([0x22, 0x06, 0x00, 0x00, 0x03, 0x2b]);
     });
 
+    /** Real 19-byte 0x12 from an Arboleaf, posted in #75 by @roberfernandez. */
+    function makeArboleafScaleInfo(): Buffer {
+      return Buffer.from([
+        0x12, 0x13, 0xff, 0x54, 0x0b, 0x04, 0x00, 0x07, 0xff, 0x15, 0x0f, 0x27, 0x00, 0x02, 0x05,
+        0x03, 0xe0, 0x6f, 0x31,
+      ]);
+    }
+
+    /** A real live 0x10 weight frame, so a session can be made to succeed. */
+    const LIVE_WEIGHT = Buffer.from([
+      0x10, 0x0e, 0xff, 0x01, 0x02, 0x02, 0x58, 0x01, 0xfd, 0x01, 0xfb, 0x00, 0x33, 0xa7,
+    ]);
+
+    it('19B 0x12 frame echoes the protocol type (Arboleaf, #75/#331)', async () => {
+      // Two reporters get the whole handshake acknowledged on 0x00 and then
+      // silence, and every captured 0x12 in this family carries 0xff at [2].
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeArboleafScaleInfo());
+      const config = writes.find((w) => w[0] === 0x13 && w[4] === 0x10);
+      expect(config![2]).toBe(0xff);
+      expect(writes.find((w) => w[0] === 0x22)![2]).toBe(0xff);
+    });
+
+    it('flips the protocol byte on the next connection after a silent session', async () => {
+      const adapter = makeAdapter();
+      await driveHandshake(adapter, makeArboleafScaleInfo());
+      adapter.onSessionEnd!();
+      const second = await driveHandshake(adapter, makeArboleafScaleInfo());
+      expect(second.find((w) => w[0] === 0x13 && w[4] === 0x10)![2]).toBe(0x00);
+    });
+
+    it('pins the protocol byte once a session produced a weight', async () => {
+      const adapter = makeAdapter();
+      await driveHandshake(adapter, makeArboleafScaleInfo());
+      expect(adapter.parseNotification(LIVE_WEIGHT)).not.toBeNull();
+      adapter.onSessionEnd!();
+      const second = await driveHandshake(adapter, makeArboleafScaleInfo());
+      expect(second.find((w) => w[0] === 0x13 && w[4] === 0x10)![2]).toBe(0xff);
+    });
+
+    it('lets an 18-byte scale that stays silent try the echo next time', async () => {
+      // The only vendor-app capture of the 18-byte length drives the scale end
+      // to end on 0xff, so a unit that gets nothing from 0x00 is worth flipping.
+      const adapter = makeAdapter();
+      await driveHandshake(adapter, makeEs26mScaleInfo());
+      adapter.onSessionEnd!();
+      const second = await driveHandshake(adapter, makeEs26mScaleInfo());
+      expect(second.find((w) => w[0] === 0x13 && w[4] === 0x10)![2]).toBe(0xff);
+    });
+
+    it('never flips the classic dialect, whose protocol byte is not in doubt', async () => {
+      const adapter = makeAdapter();
+      const info = Buffer.alloc(11);
+      info[0] = 0x12;
+      info[2] = 0xab;
+      info[10] = 1;
+      await driveHandshake(adapter, info);
+      adapter.onSessionEnd!();
+      const second = await driveHandshake(adapter, info);
+      expect(second.find((w) => w[0] === 0x13 && w[4] === 0x10)![2]).toBe(0xab);
+    });
+
     it('classic 11B 0x12 frame is unaffected by the extended-dialect rule', async () => {
       const adapter = makeAdapter();
       const info = Buffer.alloc(11);

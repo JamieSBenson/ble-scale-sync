@@ -156,6 +156,17 @@ const MAX_AE00_RESPONSES = 3;
 const EXTENDED_INFO_FRAME_LEN = 20;
 
 /**
+ * Smallest long 0x12 frame whose byte[2] is echoed back on the first attempt.
+ *
+ * Separate from EXTENDED_INFO_FRAME_LEN on purpose: that constant decides which
+ * dialect the scale speaks (and therefore whether the measurement trigger and
+ * the result-frame decode apply), this one decides only which protocol byte to
+ * open with. The 18-byte frame opens with 0x00 because a working unit sits
+ * behind that value; anything longer opens with the echo.
+ */
+const PROTO_ECHO_MIN_INFO_FRAME_LEN = 19;
+
+/**
  * Measurement trigger for the extended dialect (#235).
  *
  * On the GE CS 10 G the vendor app writes this frame twice immediately after the
@@ -303,6 +314,29 @@ export class QnScaleAdapter
    */
   private isExtendedLongFrame = false;
 
+  /** byte[2] of this session's long 0x12 frame, and the legacy alternative. */
+  private longFrameEchoProto = 0xff;
+  private longFrameLegacyProto = 0x00;
+
+  /**
+   * Protocol byte to use instead of the preferred one, after a session that
+   * produced no weight (#75, #331).
+   *
+   * A scale in this family answers 0x14, 0x21 and 0x23 happily on the wrong
+   * protocol byte and simply never streams a weight, so there is no error to
+   * react to and no negative acknowledgement to wait for. The vendor app never
+   * re-runs the handshake inside a connection either: it disconnects and comes
+   * back. So the retry happens the same way, on the next connection, which also
+   * means no timer and no half-finished sequence can outlive a session.
+   *
+   * Survives a session deliberately, and is cleared by a session that produced
+   * a weight, so a scale settles on whichever byte works for it.
+   */
+  private protoFallback: number | null = null;
+
+  /** Whether any frame this session decoded to a weight. */
+  private sawWeightFrame = false;
+
   /**
    * Whether a completed-weigh-in result frame (0xB4/0xB1) has already produced a
    * reading this session. The scale repeats the 0xB4 frame ~3x and then sends
@@ -423,6 +457,7 @@ export class QnScaleAdapter
     this.isLongFrameVariant = false;
     this.isExtendedLongFrame = false;
     this.extendedResultEmitted = false;
+    this.sawWeightFrame = false;
     this.firstStableNoImpedanceAt = null;
     this.sessionStartedScaleSeconds = Math.floor(Date.now() / 1000) - SCALE_EPOCH_OFFSET;
     this.configSent = false;
@@ -714,6 +749,15 @@ export class QnScaleAdapter
   }
 
   parseNotification(data: Buffer): ScaleReading | null {
+    const reading = this.parseFrame(data);
+    // One place records that this session produced a weight, whichever of the
+    // live, stored and result-frame paths produced it. onSessionEnd reads it to
+    // decide whether the protocol byte needs flipping for the next connection.
+    if (reading) this.sawWeightFrame = true;
+    return reading;
+  }
+
+  private parseFrame(data: Buffer): ScaleReading | null {
     if (data.length < 3) return null;
 
     bleLog.debug(`QN RAW (${data.length}B): [${hex(data)}]`);
@@ -727,14 +771,25 @@ export class QnScaleAdapter
       // MAC address. The classic QN format has ~11 bytes with protocol
       // type at [2] and weight scale flag at [10].
       if (data.length >= 18 && data[1] === data.length) {
-        // Long frame. Two dialects share this shape and disagree about byte[2]:
-        //   18 bytes (Renpho ES-26M): verified working with proto 0x00 (45e4d6e).
+        // Long frame. Every captured one carries 0xff at byte[2] whatever its
+        // length, and the disagreement is over what the firmware ACCEPTS BACK:
+        //   18 bytes (Renpho ES-26M / ES-CS20M): 0x00 has a working unit behind
+        //     it (45e4d6e), while the only vendor-app capture of this length
+        //     drives the scale end to end on 0xff (#84). Both cannot be wrong,
+        //     so the first attempt keeps the value with a working unit behind
+        //     it and a silent session flips to the other one (see protoFallback).
+        //   19 bytes (Arboleaf): 0x00 is what the adapter has always sent and
+        //     two reporters get a complete handshake followed by silence, so
+        //     the echo is tried first here (#75, #331).
         //   20 bytes (GE CS 10 G "Fit Plus"): the vendor app echoes data[2] on
-        //     the same hardware, and the frame carries two extra fields before
-        //     the checksum, so it is a later revision of the layout (#235).
+        //     the same hardware, hardware confirmed (#235).
         this.isLongFrameVariant = true;
         this.isExtendedLongFrame = data.length >= EXTENDED_INFO_FRAME_LEN;
-        this.seenProtocolType = this.isExtendedLongFrame ? data[2] : 0x00;
+        this.longFrameEchoProto = data[2];
+        this.longFrameLegacyProto = 0x00;
+        const preferred =
+          data.length >= PROTO_ECHO_MIN_INFO_FRAME_LEN ? data[2] : this.longFrameLegacyProto;
+        this.seenProtocolType = this.protoFallback ?? preferred;
         this.weightScaleFactor = 10;
       } else {
         // Classic short frame
@@ -1097,7 +1152,41 @@ export class QnScaleAdapter
       clearTimeout(this.storedRetryTimer);
       this.storedRetryTimer = null;
     }
+    this.updateProtoFallback();
     this.ctx = null;
+  }
+
+  /**
+   * Decide which protocol byte the next connection opens with (#75, #331).
+   *
+   * Only long-frame firmware is involved: the classic short frame has a
+   * protocol type at byte[2] that every unit has always accepted. A session
+   * that produced a weight settles the question and pins the byte that worked;
+   * a session that produced none flips to the other candidate, so a scale
+   * alternates at most once and then stays where it works.
+   */
+  private updateProtoFallback(): void {
+    if (!this.isLongFrameVariant) return;
+    if (this.sawWeightFrame) {
+      if (this.protoFallback !== null) {
+        bleLog.debug(
+          `QN: keeping proto 0x${this.protoFallback.toString(16).padStart(2, '0')}, ` +
+            'this scale produced a weight with it',
+        );
+      }
+      return;
+    }
+    const other =
+      this.seenProtocolType === this.longFrameEchoProto
+        ? this.longFrameLegacyProto
+        : this.longFrameEchoProto;
+    if (other === this.seenProtocolType) return;
+    this.protoFallback = other;
+    bleLog.info(
+      `The scale accepted the handshake but sent no weight. Retrying the next ` +
+        `connection with protocol byte 0x${other.toString(16).padStart(2, '0')} ` +
+        `instead of 0x${this.seenProtocolType.toString(16).padStart(2, '0')} (#75).`,
+    );
   }
 
   /** Build the 0x22 stored-data query frame with a trailing checksum. */
