@@ -128,6 +128,17 @@ export const BleSchema = z
      * Bluetooth adapter resets per hour, since every failed read triggers one.
      */
     session_timeout_sec: z.number().int().min(5).max(600).optional().nullable(),
+    /**
+     * Protocol byte the QN handshake echoes back to the scale (#75, #331).
+     *
+     * The QN family disagrees about which value its firmware accepts, and the
+     * wrong one is silent rather than an error: the scale acknowledges the whole
+     * handshake and never streams a weight. The scale-info frame length picks a
+     * default (0 for the 18-byte variant, the value the scale itself sent for
+     * anything longer); set this only when a scale runs the full handshake and
+     * then reports nothing.
+     */
+    qn_protocol_byte: z.number().int().min(0).max(255).optional().nullable(),
     mqtt_proxy: MqttProxySchema.optional(),
     esphome_proxy: EsphomeProxySchema.optional(),
   })

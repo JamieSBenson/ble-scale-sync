@@ -166,6 +166,9 @@ const EXTENDED_INFO_FRAME_LEN = 20;
  */
 const PROTO_ECHO_MIN_INFO_FRAME_LEN = 19;
 
+/** Protocol byte for a long frame whose byte[2] is not echoed back. */
+const LEGACY_PROTO_TYPE = 0x00;
+
 /**
  * Measurement trigger for the extended dialect (#235).
  *
@@ -231,6 +234,13 @@ const TRIGGER_GAP_MS = 150;
  * composition falls back to the same profile-based estimate broadcast-only
  * scales already use. Weight and BMI are the parts this decode is sure of.
  */
+/**
+ * How far before the session's start a 0xB4 record may be stamped and still
+ * count as this weigh-in. Covers clock offset between the scale and the host,
+ * nothing more: anything genuinely earlier is a previous measurement.
+ */
+const RESULT_RECORD_CLOCK_TOLERANCE_SEC = 10;
+
 const RESULT_OPCODE_B4 = 0xb4;
 const RESULT_OPCODE_B1 = 0xb1;
 const RESULT_MIN_WEIGHT_KG = 5;
@@ -314,28 +324,16 @@ export class QnScaleAdapter
    */
   private isExtendedLongFrame = false;
 
-  /** byte[2] of this session's long 0x12 frame, and the legacy alternative. */
-  private longFrameEchoProto = 0xff;
-  private longFrameLegacyProto = 0x00;
-
   /**
-   * Protocol byte to use instead of the preferred one, after a session that
-   * produced no weight (#75, #331).
+   * Protocol byte forced by `ble.qn_protocol_byte`, overriding what the frame
+   * length implies (#75, #331).
    *
-   * A scale in this family answers 0x14, 0x21 and 0x23 happily on the wrong
-   * protocol byte and simply never streams a weight, so there is no error to
-   * react to and no negative acknowledgement to wait for. The vendor app never
-   * re-runs the handshake inside a connection either: it disconnects and comes
-   * back. So the retry happens the same way, on the next connection, which also
-   * means no timer and no half-finished sequence can outlive a session.
-   *
-   * Survives a session deliberately, and is cleared by a session that produced
-   * a weight, so a scale settles on whichever byte works for it.
+   * There is no way to detect the wrong choice at runtime: a scale on the wrong
+   * byte acknowledges 0x14, 0x21 and 0x23 exactly as it does on the right one
+   * and simply never streams a weight, which is indistinguishable from nobody
+   * standing on it. So this is a setting, not a heuristic.
    */
-  private protoFallback: number | null = null;
-
-  /** Whether any frame this session decoded to a weight. */
-  private sawWeightFrame = false;
+  private forcedProtocolType: number | null = null;
 
   /**
    * Whether a completed-weigh-in result frame (0xB4/0xB1) has already produced a
@@ -376,6 +374,7 @@ export class QnScaleAdapter
   /** Receive the configured display unit from the composition root (#269). */
   configure(opts: AdapterRuntimeConfig): void {
     if (opts.weightUnit) this.displayUnit = opts.weightUnit;
+    this.forcedProtocolType = opts.qnProtocolByte ?? null;
   }
 
   /** 0x13 config unit flag: 0x01 kg, 0x02 lb (openScale QNHandler). */
@@ -457,7 +456,6 @@ export class QnScaleAdapter
     this.isLongFrameVariant = false;
     this.isExtendedLongFrame = false;
     this.extendedResultEmitted = false;
-    this.sawWeightFrame = false;
     this.firstStableNoImpedanceAt = null;
     this.sessionStartedScaleSeconds = Math.floor(Date.now() / 1000) - SCALE_EPOCH_OFFSET;
     this.configSent = false;
@@ -749,15 +747,6 @@ export class QnScaleAdapter
   }
 
   parseNotification(data: Buffer): ScaleReading | null {
-    const reading = this.parseFrame(data);
-    // One place records that this session produced a weight, whichever of the
-    // live, stored and result-frame paths produced it. onSessionEnd reads it to
-    // decide whether the protocol byte needs flipping for the next connection.
-    if (reading) this.sawWeightFrame = true;
-    return reading;
-  }
-
-  private parseFrame(data: Buffer): ScaleReading | null {
     if (data.length < 3) return null;
 
     bleLog.debug(`QN RAW (${data.length}B): [${hex(data)}]`);
@@ -773,23 +762,24 @@ export class QnScaleAdapter
       if (data.length >= 18 && data[1] === data.length) {
         // Long frame. Every captured one carries 0xff at byte[2] whatever its
         // length, and the disagreement is over what the firmware ACCEPTS BACK:
-        //   18 bytes (Renpho ES-26M / ES-CS20M): 0x00 has a working unit behind
-        //     it (45e4d6e), while the only vendor-app capture of this length
-        //     drives the scale end to end on 0xff (#84). Both cannot be wrong,
-        //     so the first attempt keeps the value with a working unit behind
-        //     it and a silent session flips to the other one (see protoFallback).
-        //   19 bytes (Arboleaf): 0x00 is what the adapter has always sent and
-        //     two reporters get a complete handshake followed by silence, so
-        //     the echo is tried first here (#75, #331).
-        //   20 bytes (GE CS 10 G "Fit Plus"): the vendor app echoes data[2] on
-        //     the same hardware, hardware confirmed (#235).
+        //   18 bytes (Renpho ES-26M / ES-CS20M): 0x00, which has a working
+        //     unit behind it (45e4d6e). The only vendor-app capture of this
+        //     length drives the scale end to end on 0xff instead (#84), so the
+        //     value is genuinely in doubt for this length and `qn_protocol_byte`
+        //     exists to try the other one without a rebuild.
+        //   19 bytes (Arboleaf): the echo. 0x00 is what the adapter has always
+        //     sent and two reporters get a complete handshake followed by
+        //     silence (#75, #331).
+        //   20 bytes (GE CS 10 G "Fit Plus"): the echo, hardware confirmed on
+        //     the same unit the vendor app was captured from (#235).
+        //
+        // The choice cannot be corrected at runtime: a scale on the wrong byte
+        // acknowledges everything and stays silent, which is exactly what a
+        // scale nobody is standing on does.
         this.isLongFrameVariant = true;
         this.isExtendedLongFrame = data.length >= EXTENDED_INFO_FRAME_LEN;
-        this.longFrameEchoProto = data[2];
-        this.longFrameLegacyProto = 0x00;
-        const preferred =
-          data.length >= PROTO_ECHO_MIN_INFO_FRAME_LEN ? data[2] : this.longFrameLegacyProto;
-        this.seenProtocolType = this.protoFallback ?? preferred;
+        const byLength = data.length >= PROTO_ECHO_MIN_INFO_FRAME_LEN ? data[2] : LEGACY_PROTO_TYPE;
+        this.seenProtocolType = this.forcedProtocolType ?? byLength;
         this.weightScaleFactor = 10;
       } else {
         // Classic short frame
@@ -999,17 +989,24 @@ export class QnScaleAdapter
       data[2] === 0x04 &&
       data[3] === 0x01
     ) {
-      // History record: usable only while it describes this weigh-in. The same
-      // window and the same reference clock as the 0x23 stored records, so a
-      // scale that reports history and a scale that reports a fresh result are
-      // judged by one rule rather than two.
+      // History record: usable only when it was written DURING this session.
+      //
+      // Deliberately stricter than the 0x23 stored-record window, which accepts
+      // a record from the minute or so before the connect. These scales keep
+      // advertising for a while after a weigh-in, so a proxy transport
+      // reconnects seconds later and finds the just-finished measurement still
+      // sitting in history; a backward-looking window would republish it as a
+      // second weigh-in. A record stamped after the session opened can only be
+      // the one being taken now. The tolerance absorbs the offset between the
+      // scale's clock and ours, which the 0x20 time sync sets each session.
       const recordSeconds = data.readUInt32LE(7);
       const sessionSeconds =
         this.sessionStartedScaleSeconds ?? Math.floor(Date.now() / 1000) - SCALE_EPOCH_OFFSET;
-      if (recordSeconds + MAX_STORED_RECORD_AGE_SEC < sessionSeconds) {
+      if (recordSeconds + RESULT_RECORD_CLOCK_TOLERANCE_SEC < sessionSeconds) {
         bleLog.debug(
-          `QN: ignoring stale 0xB4 history record (${data.readUInt16LE(11) / 100}kg, ` +
-            `${sessionSeconds - recordSeconds}s before this session) #235`,
+          `QN: ignoring 0xB4 history record (${data.readUInt16LE(11) / 100}kg, written ` +
+            `${sessionSeconds - recordSeconds}s before this session began); ` +
+            'waiting for the live 0xB1 #235',
         );
         return null;
       }
@@ -1152,41 +1149,8 @@ export class QnScaleAdapter
       clearTimeout(this.storedRetryTimer);
       this.storedRetryTimer = null;
     }
-    this.updateProtoFallback();
+    this.sessionStartedScaleSeconds = null;
     this.ctx = null;
-  }
-
-  /**
-   * Decide which protocol byte the next connection opens with (#75, #331).
-   *
-   * Only long-frame firmware is involved: the classic short frame has a
-   * protocol type at byte[2] that every unit has always accepted. A session
-   * that produced a weight settles the question and pins the byte that worked;
-   * a session that produced none flips to the other candidate, so a scale
-   * alternates at most once and then stays where it works.
-   */
-  private updateProtoFallback(): void {
-    if (!this.isLongFrameVariant) return;
-    if (this.sawWeightFrame) {
-      if (this.protoFallback !== null) {
-        bleLog.debug(
-          `QN: keeping proto 0x${this.protoFallback.toString(16).padStart(2, '0')}, ` +
-            'this scale produced a weight with it',
-        );
-      }
-      return;
-    }
-    const other =
-      this.seenProtocolType === this.longFrameEchoProto
-        ? this.longFrameLegacyProto
-        : this.longFrameEchoProto;
-    if (other === this.seenProtocolType) return;
-    this.protoFallback = other;
-    bleLog.info(
-      `The scale accepted the handshake but sent no weight. Retrying the next ` +
-        `connection with protocol byte 0x${other.toString(16).padStart(2, '0')} ` +
-        `instead of 0x${this.seenProtocolType.toString(16).padStart(2, '0')} (#75).`,
-    );
   }
 
   /** Build the 0x22 stored-data query frame with a trailing checksum. */

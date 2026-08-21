@@ -762,28 +762,41 @@ describe('QnScaleAdapter', () => {
       return out;
     }
 
-    function extendedAdapter() {
+    /**
+     * An adapter in the state a real session is in: connected (so the record
+     * freshness is judged against this session's start, as in production) and
+     * having seen the extended 0x12.
+     */
+    async function extendedAdapter() {
       const adapter = makeAdapter();
+      await adapter.onConnected({
+        write: async () => {},
+        read: async () => Buffer.alloc(0),
+        subscribe: async () => {},
+        profile: defaultProfile(),
+        deviceAddress: '',
+        availableChars: new Set<string>(),
+      } as unknown as ConnectionContext);
       expect(adapter.parseNotification(EXT_INFO)).toBeNull(); // sets isExtendedLongFrame
       return adapter;
     }
 
     /** Freeze the clock at connect 3, so record ages are the real ones. */
-    function atConnect3<T>(fn: () => T): T {
+    async function atConnect3(fn: () => Promise<void>): Promise<void> {
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-08-19T18:06:32.000Z'));
       try {
-        return fn();
+        await fn();
       } finally {
         vi.useRealTimers();
       }
     }
 
-    it('takes the live weight from 0xB1, not the stale 0xB4 in the same burst', () => {
+    it('takes the live weight from 0xB1, not the stale 0xB4 in the same burst', async () => {
       // The whole point: on this connect the 0xB4 says 67.10 kg from six days
       // ago. Publishing it would have written a wrong weight to Garmin.
-      atConnect3(() => {
-        const adapter = extendedAdapter();
+      await atConnect3(async () => {
+        const adapter = await extendedAdapter();
         expect(adapter.parseNotification(B4_STALE_6_DAYS)).toBeNull();
         expect(adapter.parseNotification(B4_STALE_6_DAYS)).toBeNull(); // repeat
         const reading = adapter.parseNotification(B1_LIVE_7525);
@@ -794,28 +807,28 @@ describe('QnScaleAdapter', () => {
       });
     });
 
-    it('decodes the live 0xB1 when the scale sends no 0xB4 at all', () => {
-      atConnect3(() => {
-        const adapter = extendedAdapter();
+    it('decodes the live 0xB1 when the scale sends no 0xB4 at all', async () => {
+      await atConnect3(async () => {
+        const adapter = await extendedAdapter();
         const reading = adapter.parseNotification(B1_LIVE_7520);
         expect(reading).not.toBeNull();
         expect(reading!.weight).toBe(75.2);
       });
     });
 
-    it("rejects the previous session's 0xB4 even though its weight looks right", () => {
+    it("rejects the previous session's 0xB4 even though its weight looks right", async () => {
       // 75.20 kg is the correct number, but the record is 178 seconds older
       // than this session: it describes the previous weigh-in, and accepting it
       // would republish an old measurement whenever the scale is quiet.
-      atConnect3(() => {
-        const adapter = extendedAdapter();
+      await atConnect3(async () => {
+        const adapter = await extendedAdapter();
         expect(adapter.parseNotification(B4_PREVIOUS_SESSION)).toBeNull();
       });
     });
 
-    it('accepts a 0xB4 whose record belongs to this session', () => {
-      atConnect3(() => {
-        const adapter = extendedAdapter();
+    it('accepts a 0xB4 whose record belongs to this session', async () => {
+      await atConnect3(async () => {
+        const adapter = await extendedAdapter();
         const fresh = stampB4(B4_PREVIOUS_SESSION, scaleSeconds('2026-08-19T18:06:30.000Z'));
         const reading = adapter.parseNotification(fresh);
         expect(reading).not.toBeNull();
@@ -823,9 +836,9 @@ describe('QnScaleAdapter', () => {
       });
     });
 
-    it('emits the result exactly once across the repeated burst', () => {
-      atConnect3(() => {
-        const adapter = extendedAdapter();
+    it('emits the result exactly once across the repeated burst', async () => {
+      await atConnect3(async () => {
+        const adapter = await extendedAdapter();
         expect(adapter.parseNotification(B1_LIVE_7525)).not.toBeNull();
         // The rest of the burst (the 0xB1 03 02/03 records, a repeat 0xB1)
         // describes the same weigh-in and must not produce a second reading.
@@ -834,17 +847,17 @@ describe('QnScaleAdapter', () => {
       });
     });
 
-    it('rejects a result frame with a corrupted checksum', () => {
-      atConnect3(() => {
-        const adapter = extendedAdapter();
+    it('rejects a result frame with a corrupted checksum', async () => {
+      await atConnect3(async () => {
+        const adapter = await extendedAdapter();
         const bad = Buffer.from(B1_LIVE_7525);
         bad[bad.length - 1] ^= 0xff; // break the trailing sum checksum
         expect(adapter.parseNotification(bad)).toBeNull();
       });
     });
 
-    it('does not decode result frames on a non-extended dialect', () => {
-      atConnect3(() => {
+    it('does not decode result frames on a non-extended dialect', async () => {
+      await atConnect3(async () => {
         const adapter = makeAdapter(); // no extended 0x12 seen -> classic dialect
         // Same bytes, but the gate is closed, so it falls through to the ignore
         // branch and returns null rather than a spurious weight.
@@ -1340,11 +1353,6 @@ describe('AE02 dispatch (#75, #235)', () => {
       ]);
     }
 
-    /** A real live 0x10 weight frame, so a session can be made to succeed. */
-    const LIVE_WEIGHT = Buffer.from([
-      0x10, 0x0e, 0xff, 0x01, 0x02, 0x02, 0x58, 0x01, 0xfd, 0x01, 0xfb, 0x00, 0x33, 0xa7,
-    ]);
-
     it('19B 0x12 frame echoes the protocol type (Arboleaf, #75/#331)', async () => {
       // Two reporters get the whole handshake acknowledged on 0x00 and then
       // silence, and every captured 0x12 in this family carries 0xff at [2].
@@ -1355,43 +1363,42 @@ describe('AE02 dispatch (#75, #235)', () => {
       expect(writes.find((w) => w[0] === 0x22)![2]).toBe(0xff);
     });
 
-    it('flips the protocol byte on the next connection after a silent session', async () => {
+    it('leaves the next connection alone when a session produced no weight', async () => {
+      // A scale on the wrong protocol byte acknowledges the whole handshake and
+      // stays silent, which is exactly what a scale nobody is standing on does.
+      // Nothing may be inferred from silence: these scales keep advertising
+      // after a weigh-in, so the routine reconnect that follows one is silent
+      // too, and reacting to it would break the next real weigh-in (#75).
       const adapter = makeAdapter();
       await driveHandshake(adapter, makeArboleafScaleInfo());
-      adapter.onSessionEnd!();
-      const second = await driveHandshake(adapter, makeArboleafScaleInfo());
-      expect(second.find((w) => w[0] === 0x13 && w[4] === 0x10)![2]).toBe(0x00);
-    });
-
-    it('pins the protocol byte once a session produced a weight', async () => {
-      const adapter = makeAdapter();
-      await driveHandshake(adapter, makeArboleafScaleInfo());
-      expect(adapter.parseNotification(LIVE_WEIGHT)).not.toBeNull();
       adapter.onSessionEnd!();
       const second = await driveHandshake(adapter, makeArboleafScaleInfo());
       expect(second.find((w) => w[0] === 0x13 && w[4] === 0x10)![2]).toBe(0xff);
     });
 
-    it('lets an 18-byte scale that stays silent try the echo next time', async () => {
-      // The only vendor-app capture of the 18-byte length drives the scale end
-      // to end on 0xff, so a unit that gets nothing from 0x00 is worth flipping.
+    it('lets ble.qn_protocol_byte override the length-based default', async () => {
       const adapter = makeAdapter();
-      await driveHandshake(adapter, makeEs26mScaleInfo());
-      adapter.onSessionEnd!();
-      const second = await driveHandshake(adapter, makeEs26mScaleInfo());
-      expect(second.find((w) => w[0] === 0x13 && w[4] === 0x10)![2]).toBe(0xff);
+      adapter.configure({ qnProtocolByte: 0x00 });
+      const writes = await driveHandshake(adapter, makeArboleafScaleInfo());
+      expect(writes.find((w) => w[0] === 0x13 && w[4] === 0x10)![2]).toBe(0x00);
+      expect(writes.find((w) => w[0] === 0x22)![2]).toBe(0x00);
     });
 
-    it('never flips the classic dialect, whose protocol byte is not in doubt', async () => {
+    it('applies the override to the 18-byte dialect too', async () => {
+      // The only vendor-app capture of this length drives the scale on 0xff,
+      // so an 18-byte owner who gets nothing has somewhere to go.
       const adapter = makeAdapter();
-      const info = Buffer.alloc(11);
-      info[0] = 0x12;
-      info[2] = 0xab;
-      info[10] = 1;
-      await driveHandshake(adapter, info);
-      adapter.onSessionEnd!();
-      const second = await driveHandshake(adapter, info);
-      expect(second.find((w) => w[0] === 0x13 && w[4] === 0x10)![2]).toBe(0xab);
+      adapter.configure({ qnProtocolByte: 0xff });
+      const writes = await driveHandshake(adapter, makeEs26mScaleInfo());
+      expect(writes.find((w) => w[0] === 0x13 && w[4] === 0x10)![2]).toBe(0xff);
+    });
+
+    it('returns to the length-based default when the override is removed', async () => {
+      const adapter = makeAdapter();
+      adapter.configure({ qnProtocolByte: 0x00 });
+      adapter.configure({});
+      const writes = await driveHandshake(adapter, makeArboleafScaleInfo());
+      expect(writes.find((w) => w[0] === 0x13 && w[4] === 0x10)![2]).toBe(0xff);
     });
 
     it('classic 11B 0x12 frame is unaffected by the extended-dialect rule', async () => {
