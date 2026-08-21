@@ -1,6 +1,7 @@
 import type { ScaleAdapter, ScaleReading, BleDeviceInfo } from '../interfaces/scale-adapter.js';
 import { hasParseableBroadcastSource, type RawReading } from './shared.js';
-import { bleLog, normalizeUuid } from './types.js';
+import { bleLog, normalizeUuid, BT_BASE_UUID_SUFFIX } from './types.js';
+import { isDebugEnabled } from '../logger.js';
 
 // ─── Advertisement decision (pure) ─────────────────────────────────────────────
 
@@ -192,9 +193,6 @@ export class DedupWindow {
 
 // ─── Advertisement logging (diagnostics) ───────────────────────────────────────
 
-/** The SIG base UUID suffix shared by every 16-bit UUID in its 128-bit form. */
-const BASE_SUFFIX = '00001000800000805f9b34fb';
-
 /** How many UUIDs of one kind are printed before the rest are summarised. */
 const UUID_LIST_CAP = 10;
 /** How many advertisement bytes of one blob are printed. */
@@ -203,7 +201,11 @@ const DATA_BYTE_CAP = 24;
 /** Print the 16-bit short form for SIG-base UUIDs, the full form otherwise. */
 function shortUuid(uuid: string): string {
   const normalized = normalizeUuid(uuid);
-  if (normalized.length === 32 && normalized.startsWith('0000') && normalized.endsWith(BASE_SUFFIX))
+  if (
+    normalized.length === 32 &&
+    normalized.startsWith('0000') &&
+    normalized.endsWith(BT_BASE_UUID_SUFFIX)
+  )
     return normalized.slice(4, 8);
   return normalized;
 }
@@ -231,7 +233,13 @@ function blob(data: Buffer): string {
  * carry one: matching is on advertised content, never on who sent it.
  */
 export function formatAdvert(address: string, info: BleDeviceInfo): string {
-  const parts = [`[${address}]`, `name=${info.localName ? `"${info.localName}"` : '(none)'}`];
+  // Canonical uppercase form: the transports hand addresses over in different
+  // cases, and the same device has to produce the same line for the dedup below
+  // to mean anything.
+  const parts = [
+    `[${address.toUpperCase()}]`,
+    `name=${info.localName ? `"${info.localName}"` : '(none)'}`,
+  ];
   parts.push(`uuids=${uuidList(info.serviceUuids)}`);
   if (info.manufacturerData) {
     const id = info.manufacturerData.id.toString(16).padStart(4, '0');
@@ -254,6 +262,14 @@ export function formatAdvert(address: string, info: BleDeviceInfo): string {
 const lastAdvertLine = new Map<string, string>();
 
 /**
+ * Cap on remembered addresses. Devices using resolvable private addresses
+ * rotate theirs every few minutes, and a watcher runs for weeks, so an
+ * unbounded map is a slow leak on the smallest supported host. Oldest entry
+ * out, same as the other caches on this path.
+ */
+const ADVERT_CACHE_MAX = 64;
+
+/**
  * Log an advertisement once per distinct content, on any transport.
  *
  * The node-ble handler has its own richer version built from D-Bus properties
@@ -264,9 +280,18 @@ const lastAdvertLine = new Map<string, string>();
  * `key=value` so a line is self-describing.
  */
 export function logAdvert(address: string, info: BleDeviceInfo): void {
+  // Checked before the line is built, not after: this runs on every
+  // advertisement of every device in range, and formatting one is the whole
+  // cost. The node-ble handler guards its sibling line the same way.
+  if (!isDebugEnabled()) return;
+  const key = address.toLowerCase();
   const line = formatAdvert(address, info);
-  if (lastAdvertLine.get(address) === line) return;
-  lastAdvertLine.set(address, line);
+  if (lastAdvertLine.get(key) === line) return;
+  if (!lastAdvertLine.has(key) && lastAdvertLine.size >= ADVERT_CACHE_MAX) {
+    const oldest = lastAdvertLine.keys().next().value;
+    if (oldest !== undefined) lastAdvertLine.delete(oldest);
+  }
+  lastAdvertLine.set(key, line);
   bleLog.debug(line);
 }
 

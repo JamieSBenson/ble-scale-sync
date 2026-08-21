@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { formatAdvert, logAdvert, _resetAdvertLog } from '../../src/ble/advertisement.js';
 import { bleLog } from '../../src/ble/types.js';
+import { setLogLevel, LogLevel } from '../../src/logger.js';
 import type { BleDeviceInfo } from '../../src/interfaces/scale-adapter.js';
 
 const ADDR = 'AA:BB:CC:DD:EE:FF';
@@ -14,7 +15,10 @@ function info(over: Partial<BleDeviceInfo> = {}): BleDeviceInfo {
 }
 
 describe('advertisement logging (#322)', () => {
-  beforeEach(() => _resetAdvertLog());
+  beforeEach(() => {
+    _resetAdvertLog();
+    setLogLevel(LogLevel.DEBUG);
+  });
 
   describe('formatAdvert()', () => {
     it('prints the address, the name and 16-bit short UUIDs', () => {
@@ -108,6 +112,37 @@ describe('advertisement logging (#322)', () => {
       logAdvert(ADDR, info());
       logAdvert(ADDR, info({ characteristicUuids: ['0000ffb2-0000-1000-8000-00805f9b34fb'] }));
       expect(debug).toHaveBeenCalledTimes(3);
+      debug.mockRestore();
+    });
+
+    it('does no work at all when debug logging is off', () => {
+      // This runs on every advertisement of every device in range, so the cost
+      // of the line has to be zero when nobody is going to read it.
+      setLogLevel(LogLevel.INFO);
+      const debug = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      logAdvert(ADDR, info());
+      expect(debug).not.toHaveBeenCalled();
+      debug.mockRestore();
+      setLogLevel(LogLevel.DEBUG);
+    });
+
+    it('forgets the oldest address rather than growing without bound', () => {
+      const debug = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      // Fill past the cap, then revisit the first address: it must have been
+      // evicted, so it logs a second time.
+      for (let i = 0; i < 70; i++)
+        logAdvert(`00:00:00:00:00:${i.toString(16).padStart(2, '0')}`, info());
+      debug.mockClear();
+      logAdvert('00:00:00:00:00:00', info());
+      expect(debug).toHaveBeenCalledTimes(1);
+      debug.mockRestore();
+    });
+
+    it('treats an address as the same device whatever its case', () => {
+      const debug = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      logAdvert(ADDR, info());
+      logAdvert(ADDR.toLowerCase(), info());
+      expect(debug).toHaveBeenCalledTimes(1);
       debug.mockRestore();
     });
 
