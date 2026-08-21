@@ -3,7 +3,7 @@ import type { EsphomeProxyConfig } from '../../config/schema.js';
 import type { ScanOptions, ScanResult } from '../types.js';
 import { type RawReading, waitForRawReading } from '../shared.js';
 import { resolveAdapter } from '../../scales/resolve.js';
-import { evaluateAdvertisement, GraceTimers } from '../advertisement.js';
+import { evaluateAdvertisement, GraceTimers, logAdvert } from '../advertisement.js';
 import { bleLog, errMsg, withTimeout, IMPEDANCE_GRACE_MS } from '../types.js';
 import { EsphomeProxyPool } from './pool.js';
 
@@ -93,6 +93,7 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
             const addrLc = address.toLowerCase();
             if (targetLc && addrLc !== targetLc) return;
 
+            logAdvert(address, info);
             const adapter = resolveAdapter(info, adapters);
             if (!adapter) {
               if (!seenAddrs.has(address)) {

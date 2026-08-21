@@ -3,7 +3,7 @@ import type { MqttProxyConfig } from '../../config/schema.js';
 import type { RawReading } from '../shared.js';
 import { waitForRawReading } from '../shared.js';
 import { resolveAdapter } from '../../scales/resolve.js';
-import { evaluateAdvertisement, GraceTimers, DedupWindow } from '../advertisement.js';
+import { evaluateAdvertisement, GraceTimers, DedupWindow, logAdvert } from '../advertisement.js';
 import type { Watcher, WatcherConfig } from '../reading-source.js';
 import { bleLog, withTimeout, errMsg, IMPEDANCE_GRACE_MS } from '../types.js';
 import { AsyncQueue } from '../async-queue.js';
@@ -222,6 +222,7 @@ export class ReadingWatcher implements Watcher {
         for (const entry of candidates) {
           this.rememberScanEntry(entry);
           const info = toBleDeviceInfo(entry);
+          logAdvert(entry.address, info);
           const adapter = resolveAdapter(info, this.adapters);
           if (!adapter) continue;
 
@@ -538,6 +539,7 @@ export class ReadingWatcher implements Watcher {
         cached ?? { address: data.address, name: '', rssi: 0, services: [] },
       );
       info.characteristicUuids = data.chars.map((c) => c.uuid.toLowerCase());
+      logAdvert(data.address, info);
       if (cached?.name) {
         bleLog.debug(`Autonomous connect: using cached advertisement name "${cached.name}"`);
       }

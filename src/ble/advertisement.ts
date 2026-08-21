@@ -1,5 +1,6 @@
 import type { ScaleAdapter, ScaleReading, BleDeviceInfo } from '../interfaces/scale-adapter.js';
 import { hasParseableBroadcastSource, type RawReading } from './shared.js';
+import { bleLog, normalizeUuid } from './types.js';
 
 // ─── Advertisement decision (pure) ─────────────────────────────────────────────
 
@@ -187,4 +188,89 @@ export class DedupWindow {
       if (now - ts >= this.windowMs) this.seen.delete(key);
     }
   }
+}
+
+// ─── Advertisement logging (diagnostics) ───────────────────────────────────────
+
+/** The SIG base UUID suffix shared by every 16-bit UUID in its 128-bit form. */
+const BASE_SUFFIX = '00001000800000805f9b34fb';
+
+/** How many UUIDs of one kind are printed before the rest are summarised. */
+const UUID_LIST_CAP = 10;
+/** How many advertisement bytes of one blob are printed. */
+const DATA_BYTE_CAP = 24;
+
+/** Print the 16-bit short form for SIG-base UUIDs, the full form otherwise. */
+function shortUuid(uuid: string): string {
+  const normalized = normalizeUuid(uuid);
+  if (normalized.length === 32 && normalized.startsWith('0000') && normalized.endsWith(BASE_SUFFIX))
+    return normalized.slice(4, 8);
+  return normalized;
+}
+
+function uuidList(uuids: string[]): string {
+  const shown = uuids.slice(0, UUID_LIST_CAP).map(shortUuid);
+  const rest = uuids.length - shown.length;
+  return `[${shown.join(', ')}${rest > 0 ? `, +${rest} more` : ''}]`;
+}
+
+function blob(data: Buffer): string {
+  const hex = data.subarray(0, DATA_BYTE_CAP).toString('hex');
+  return data.length > DATA_BYTE_CAP ? `${hex}… (${data.length}B)` : hex;
+}
+
+/**
+ * One-line summary of everything an adapter's `matches()` is allowed to see.
+ *
+ * Adapter mis-routing was the root cause of #317, #318 and #319, and every one
+ * of those was reported over a proxy transport. Reproducing the decision from a
+ * pasted log needs the exact inputs, so this prints the whole `BleDeviceInfo`
+ * rather than a summary of it.
+ *
+ * The address is passed separately because `BleDeviceInfo` deliberately does not
+ * carry one: matching is on advertised content, never on who sent it.
+ */
+export function formatAdvert(address: string, info: BleDeviceInfo): string {
+  const parts = [`[${address}]`, `name=${info.localName ? `"${info.localName}"` : '(none)'}`];
+  parts.push(`uuids=${uuidList(info.serviceUuids)}`);
+  if (info.manufacturerData) {
+    const id = info.manufacturerData.id.toString(16).padStart(4, '0');
+    parts.push(`manufacturerData={0x${id}: ${blob(info.manufacturerData.data)}}`);
+  }
+  if (info.serviceData && info.serviceData.length > 0) {
+    const entries = info.serviceData.map((e) => `${shortUuid(e.uuid)}: ${blob(e.data)}`);
+    parts.push(`serviceData={${entries.join(', ')}}`);
+  }
+  if (info.characteristicUuids) parts.push(`chars=${uuidList(info.characteristicUuids)}`);
+  return `Advert: ${parts.join(' ')}`;
+}
+
+/**
+ * Per-address cache of the last advert line printed, so a scan that re-reads the
+ * same advertisement several times a second logs it once. A changed
+ * fingerprint (a scan response filling in the name, or post-discovery
+ * characteristics arriving) prints again, which is the interesting case.
+ */
+const lastAdvertLine = new Map<string, string>();
+
+/**
+ * Log an advertisement once per distinct content, on any transport.
+ *
+ * The node-ble handler has its own richer version built from D-Bus properties
+ * (address type and advertising flags, which no other transport exposes); this
+ * is the equivalent for the proxy transports, which previously logged nothing a
+ * reporter could paste. Both use the same `Advert:` prefix on purpose, so one
+ * grep works whatever the transport, and both spell out their fields as
+ * `key=value` so a line is self-describing.
+ */
+export function logAdvert(address: string, info: BleDeviceInfo): void {
+  const line = formatAdvert(address, info);
+  if (lastAdvertLine.get(address) === line) return;
+  lastAdvertLine.set(address, line);
+  bleLog.debug(line);
+}
+
+/** Test seam: forget every remembered advert line. */
+export function _resetAdvertLog(): void {
+  lastAdvertLine.clear();
 }

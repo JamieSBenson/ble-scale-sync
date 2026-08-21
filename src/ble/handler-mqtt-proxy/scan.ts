@@ -8,7 +8,7 @@ import type { ScanOptions, ScanResult } from '../types.js';
 import type { RawReading } from '../shared.js';
 import { waitForRawReading } from '../shared.js';
 import { resolveAdapter } from '../../scales/resolve.js';
-import { evaluateAdvertisement } from '../advertisement.js';
+import { evaluateAdvertisement, logAdvert } from '../advertisement.js';
 import { bleLog, normalizeUuid, withTimeout } from '../types.js';
 import { COMMAND_TIMEOUT_MS, topics, type Topics } from './topics.js';
 import { type MqttClient, createMqttClient } from './client.js';
@@ -150,6 +150,7 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
 
     for (const entry of candidates) {
       const info = toBleDeviceInfo(entry);
+      logAdvert(entry.address, info);
       const adapter = resolveAdapter(info, adapters);
       if (!adapter) continue;
 
