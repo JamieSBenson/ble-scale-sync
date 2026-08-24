@@ -177,6 +177,13 @@ function initializeAdapter(
   start: () => Promise<void>;
   cleanup: () => void;
   /**
+   * Register a notification unsubscriber for teardown at the end of the
+   * session. Use this rather than pushing onto the array directly: a subscribe
+   * can settle after the session has already been torn down, and this drops
+   * the listener straight away in that case.
+   */
+  register: (unsub: () => void) => void;
+  /**
    * Re-send a send-once unlock after notifications are confirmed enabled.
    * No-op for adapters with a repeating interval or no legacy unlock.
    */
@@ -185,8 +192,28 @@ function initializeAdapter(
   let unlockInterval: ReturnType<typeof setInterval> | null = null;
   let resendUnlock: (() => Promise<void>) | null = null;
 
+  let closed = false;
+  /**
+   * A subscribe that resolves after cleanup() has already drained the list has
+   * nobody left to unsubscribe it. On the proxy transports the underlying
+   * client outlives the session, so such a listener stays attached for the
+   * lifetime of the process and re-processes every later notification (#338).
+   */
+  const register = (unsub: () => void): void => {
+    if (closed) {
+      try {
+        unsub();
+      } catch (e: unknown) {
+        bleLog.debug(`Late unsubscribe failed: ${errMsg(e)}`);
+      }
+      return;
+    }
+    unsubscribers.push(unsub);
+  };
+
   let sessionEnded = false;
   const cleanup = (): void => {
+    closed = true;
     if (unlockInterval) {
       clearInterval(unlockInterval);
       unlockInterval = null;
@@ -228,7 +255,7 @@ function initializeAdapter(
         },
         subscribe: async (charUuid) => {
           const unsub = await subscribeToChar(charMap, charUuid, onNotification, adapter.name);
-          unsubscribers.push(unsub);
+          register(unsub);
         },
       };
       bleLog.debug('Calling adapter.onConnected()');
@@ -290,7 +317,7 @@ function initializeAdapter(
     if (resendUnlock) await resendUnlock();
   };
 
-  return { start, cleanup, resendUnlockAfterSubscribe };
+  return { start, cleanup, register, resendUnlockAfterSubscribe };
 }
 
 /** Subscribe to notifications in multi-char or legacy mode, then start adapter init. */
@@ -300,7 +327,7 @@ async function subscribeAndInit(
   onNotification: (sourceUuid: string, data: Buffer) => void,
   startInit: () => Promise<void>,
   onNotifyEnabled: () => Promise<void>,
-  unsubscribers: (() => void)[],
+  register: (unsub: () => void) => void,
 ): Promise<void> {
   if (adapter.characteristics) {
     // Multi-char mode
@@ -322,7 +349,7 @@ async function subscribeAndInit(
       bleLog.debug(`Subscribing to ${binding.uuid} (${binding.type})...`);
       try {
         const unsub = await subscribeToChar(charMap, binding.uuid, onNotification, adapter.name);
-        unsubscribers.push(unsub);
+        register(unsub);
         subscribed += 1;
       } catch (err) {
         // A characteristic being present says nothing about it being
@@ -380,12 +407,16 @@ async function subscribeAndInit(
       ? adapter.charNotifyUuid!
       : adapter.altCharNotifyUuid!;
     // Legacy mode — subscribe + first unlock in parallel to prevent
-    // the scale from disconnecting before receiving the unlock command
-    const [unsub] = await Promise.all([
-      subscribeToChar(charMap, effectiveNotifyUuid, onNotification, adapter.name),
+    // the scale from disconnecting before receiving the unlock command.
+    // Register the unsubscriber from inside the subscribe chain rather than
+    // after the Promise.all: a rejecting startInit() makes Promise.all discard
+    // the still-pending subscribe, and the listener it goes on to install
+    // would then never be torn down (#338). register() handles the case where
+    // the session was already cleaned up by then.
+    await Promise.all([
+      subscribeToChar(charMap, effectiveNotifyUuid, onNotification, adapter.name).then(register),
       startInit(),
     ]);
-    unsubscribers.push(unsub);
     bleLog.info('Subscribed to notifications. Step on the scale.');
     // The unlock above was necessarily written before notifications were on:
     // noble queues the CCCD write from inside its descriptor discovery
@@ -562,7 +593,7 @@ export function waitForRawReading(
       handleNotification,
       init.start,
       init.resendUnlockAfterSubscribe,
-      unsubscribers,
+      init.register,
     ).catch((e) => {
       if (!resolved) {
         init.cleanup();

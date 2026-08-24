@@ -1528,3 +1528,77 @@ describe('waitForRawReading() with the real KoogeekS1Adapter (#270)', () => {
     expect((await promise).reading).toEqual({ weight: 78.3, impedance: 470 });
   });
 });
+
+// ─── Notification teardown on a failed init ─────────────────────────────────
+
+describe('waitForRawReading() — notification teardown', () => {
+  it('releases the notify subscription when adapter init rejects mid-subscribe', async () => {
+    // Legacy mode races the subscribe against the adapter handshake. When the
+    // handshake loses, Promise.all abandons the subscribe, which goes on to
+    // install its listener with nobody left to remove it. On the proxy
+    // transports the client outlives the session, so that listener then
+    // re-processes every later notification (#338).
+    const unsub = vi.fn();
+    let releaseSubscribe!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseSubscribe = r;
+    });
+
+    const notifyChar = createMockChar();
+    notifyChar.subscribe = vi.fn(async () => {
+      await gate;
+      notifyChar.subscribeCalled = true;
+      return unsub;
+    });
+    const writeChar = createMockChar();
+    const device = createMockDevice();
+    const { charMap } = createCharMap([
+      [NOTIFY_UUID, notifyChar],
+      [WRITE_UUID, writeChar],
+    ]);
+
+    const adapter = createLegacyAdapter({
+      onConnected: vi.fn(async (_ctx: ConnectionContext) => {
+        throw new Error('handshake failed');
+      }),
+    });
+
+    const promise = waitForRawReading(charMap, device, adapter, PROFILE, '');
+    await expect(promise).rejects.toThrow('handshake failed');
+
+    // The session is already torn down while the subscribe is still in flight.
+    expect(unsub).not.toHaveBeenCalled();
+
+    releaseSubscribe();
+    await vi.waitFor(() => expect(unsub).toHaveBeenCalledTimes(1));
+  });
+
+  it('releases every notify subscription once the session ends normally', async () => {
+    const unsub = vi.fn();
+    const notifyChar = createMockChar();
+    notifyChar.subscribe = vi.fn(async (onData) => {
+      notifyChar.subscribeCalled = true;
+      notifyChar.triggerData = (data: Buffer) => onData(data);
+      return unsub;
+    });
+    const writeChar = createMockChar();
+    const device = createMockDevice();
+    const { charMap } = createCharMap([
+      [NOTIFY_UUID, notifyChar],
+      [WRITE_UUID, writeChar],
+    ]);
+
+    const adapter = createLegacyAdapter({
+      parseNotification: vi.fn((data: Buffer) =>
+        data[0] === 0x10 ? { weight: 75.5, impedance: 500 } : null,
+      ),
+    });
+
+    const promise = waitForRawReading(charMap, device, adapter, PROFILE, '');
+    await vi.waitFor(() => expect(notifyChar.subscribeCalled).toBe(true));
+    notifyChar.triggerData(Buffer.from([0x10]));
+
+    await promise;
+    await vi.waitFor(() => expect(unsub).toHaveBeenCalledTimes(1));
+  });
+});
