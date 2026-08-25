@@ -647,11 +647,17 @@ export function createNobleHandler({ noble, getState }: NobleHandlerDeps) {
       if (seen.has(addr)) return;
       seen.add(addr);
 
-      const name = peripheral.advertisement?.localName ?? '(unknown)';
+      // The sentinel is for display only. It must NOT reach `matches()`: it is
+      // a truthy string, and adapters that branch on whether an advertisement
+      // carries a name would read a nameless device as named, so this tool
+      // would report an adapter the read path does not choose. `npm run scan`
+      // is what users are told to run to fill in `ble.force_scale_adapter`, so
+      // a wrong answer here is acted on.
+      const localName = peripheral.advertisement?.localName ?? '';
       const svcUuids = (peripheral.advertisement?.serviceUuids ?? []).map(normalizeUuid);
       const mfgData = parseMfgData(peripheral.advertisement?.manufacturerData);
       const info: BleDeviceInfo = {
-        localName: name,
+        localName,
         serviceUuids: svcUuids,
         manufacturerData: mfgData,
       };
@@ -659,7 +665,7 @@ export function createNobleHandler({ noble, getState }: NobleHandlerDeps) {
 
       results.push({
         address: addr,
-        name,
+        name: localName || '(unknown)',
         matchedAdapter: matched?.name,
       });
     };

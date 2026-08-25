@@ -8,6 +8,7 @@ import {
   type Adapter,
   type Device,
 } from './dbus.js';
+import { isDeviceObjectGone } from './device-object.js';
 
 /** Extract a Buffer from a D-Bus value that may be a Variant wrapper, Buffer, Uint8Array, or number[]. */
 export function extractDbusBytes(val: unknown): Buffer | null {
@@ -173,13 +174,17 @@ export async function broadcastScanNodeBle(
      *
      * BlueZ keys this dict by company id and strips it from the value, which is
      * exactly the shape `parseBroadcast` expects, so the value is passed
-     * through unchanged. The company id is not filtered here because the
-     * interface carries no way to ask an adapter which id it wants; the adapter
-     * has already been matched on it before this scan started.
+     * through unchanged.
+     *
+     * Entries under a different company id are skipped when the adapter
+     * declares one, so a device advertising under two ids cannot have the
+     * wrong element parsed as a reading.
      */
+    const wantedCompanyId = adapter.match?.manufacturerId;
     const tryManufacturerData = (md: unknown): boolean => {
       if (!adapter.parseBroadcast) return false;
-      for (const [, buf] of dbusEntries(md)) {
+      for (const [key, buf] of dbusEntries(md)) {
+        if (wantedCompanyId !== undefined && Number(key) !== wantedCompanyId) continue;
         const reading = adapter.parseBroadcast(buf);
         if (reading && consume(reading)) return true;
       }
@@ -211,15 +216,29 @@ export async function broadcastScanNodeBle(
         if (abortSignal?.aborted) break;
         try {
           const helper = helperOf(device);
+          // Each property is read separately so one failing does not hide the
+          // other, but the rejection is NOT swallowed: BlueZ dropping the
+          // Device1 object is the failure this whole path exists for, and a
+          // silent poll would spin for the full discovery timeout and then
+          // report the generic "no reading" message instead of the real cause.
           if (adapter.parseServiceData) {
-            const sd: unknown = await helper.prop('ServiceData').catch(() => undefined);
+            const sd: unknown = await helper.prop('ServiceData');
             if (tryServiceData(sd)) break;
           }
           if (adapter.parseBroadcast) {
-            const md: unknown = await helper.prop('ManufacturerData').catch(() => undefined);
+            const md: unknown = await helper.prop('ManufacturerData');
             if (tryManufacturerData(md)) break;
           }
         } catch (err: unknown) {
+          if (isDeviceObjectGone(err)) {
+            fail(
+              new Error(
+                `BlueZ removed the device object for ${mac} during the broadcast scan, ` +
+                  `so it is only visible while scanning is active (#297): ${errMsg(err)}`,
+              ),
+            );
+            break;
+          }
           bleLog.debug(`Advertisement poll error: ${errMsg(err)}`);
         }
         await sleep(500);

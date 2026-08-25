@@ -127,6 +127,12 @@ export class Silvergear108Adapter implements ScaleAdapterCore, BroadcastSource {
     const uuids = device.serviceUuids ?? [];
     if (uuids.length > 0 && !uuidClaimHits([SVC_FFB0], uuids)) return false;
     const p = m.data.subarray(PAYLOAD_OFFSET);
+    // Gate on the frame grammar as well as the checksum. The checksum is only
+    // five bits wide, so on its own it would accept roughly one unrelated
+    // payload in 32; requiring a known frame type costs nothing on real frames
+    // and matters because this adapter outranks Robi, Hutbit and MGB, so a
+    // same-OEM sibling appearing on 0xA0AC would otherwise be claimed here.
+    if (p[4] !== FRAME_TYPE_WEIGHT && p[4] !== FRAME_TYPE_BODY) return false;
     return p[5] === payloadChecksum(p);
   }
 

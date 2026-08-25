@@ -87,19 +87,34 @@ const SVC_D618 = 'd618';
  * priority, and a Robi reaching a proxy transport arrives nameless by
  * construction. Dropping D618 there would hand those units to this adapter,
  * which subscribes FFB1/FFB2 only and rejects every 20-byte Robi frame on
- * length (#248 runs on exactly that transport). A NAMED advertisement has
- * already been through the name branches of every adapter in this family
- * before it reaches here: `RobiS9Adapter.matches()` bows out of `swan`,
- * `icomon` and `yg` and claims `robi` before it consults this predicate at
- * all, so relaxing the named case cannot take a device from it.
+ * length (#248 runs on exactly that transport).
  *
- * What the named case does still take, and it is worth being plain about it:
- * an MGB Swan/Icomon/YG that squatted on the same company id with a 6- or
- * 7-byte payload and no D618 would now be claimed here at priority 35 instead
- * of by MGB at 30. No such unit has been reported, the failure mode is a
- * refused read rather than a wrong weight (each parser rejects the other's
- * frames on length), and `ble.force_scale_adapter` with `ble.scale_mac` is the
- * escape hatch if one turns up.
+ * What the named case takes, stated exactly, because the tempting summary
+ * ("a named device has already been claimed by its own adapter") is FALSE:
+ *
+ *   `RobiS9Adapter.matches()` claims only a name containing `robi` and bows
+ *   out of only `swan`, `icomon` and `yg`. Every OTHER name falls through to
+ *   this predicate. So a Robi sold under a rebadged name, and an MGB
+ *   Icomon/YG/Swan, are both claimed here at priority 35 if they carry the
+ *   0x02AC signature. Observed against the live registry:
+ *
+ *     named "Robi S9",  ffb0 + ffb3 chars, 0x02AC  ->  Robi S9   (unchanged)
+ *     named "S9",       ffb0 + ffb3 chars, 0x02AC  ->  Hutbit
+ *     named "icomon",   ffb0,              0x02AC  ->  Hutbit    (was MGB)
+ *
+ * No captured Robi or MGB advertisement in this repo carries 0x02AC
+ * manufacturer data, so this is a family-shaped risk rather than an observed
+ * one, and the failure mode is a refused read rather than a wrong weight,
+ * since each parser rejects the other's frames on length. But this is a Lefu
+ * OEM family where the branded name is known NOT to be universal (the Hutbit's
+ * own OEM stock advertises "SWAN"), so it is a real exposure and not a
+ * theoretical one. `ble.force_scale_adapter` with `ble.scale_mac` is the
+ * escape hatch if a unit turns up on the wrong side of it.
+ *
+ * The FFB3 result characteristic is NOT usable as a negative gate here: the
+ * Hutbit exposes an unused FFB3 too, so gating on it would hand a nameless
+ * Hutbit straight back to Robi, which is the exact regression this predicate
+ * exists to prevent (#278).
  */
 export function isHutbitOemAdvert(device: BleDeviceInfo): boolean {
   const m = device.manufacturerData;

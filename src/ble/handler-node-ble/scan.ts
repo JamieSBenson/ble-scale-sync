@@ -282,9 +282,16 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
       // connection, so an adapter matching only on serviceUuids still falls
       // through to the GATT path.
       //
-      // Scope: the result is used only to take the passive branch below. A device
-      // that now matches a connect-based adapter here falls through exactly as it
-      // did before and is re-resolved after discovery.
+      // Scope: the result takes the passive branch below, and it is ALSO passed
+      // to acquireGattServer, which branches on `requiresBonding` to decide
+      // whether to bond before connecting and to retry on a discovery timeout
+      // (#290). Exactly one adapter in the registry sets that flag, so the whole
+      // reach of the widening on the connect path is that a MAC-pinned nameless
+      // Beurer advertising company id 0x0611 plus a SIG WSS/BCS service now
+      // reaches the bond-on-timeout retry, where the pre-match used to be
+      // undefined and the retry could never engage. That is the retry working as
+      // designed. Otherwise a device matching a connect-based adapter here falls
+      // through as before and is re-resolved after discovery.
       const preInfo: BleDeviceInfo = {
         localName: name,
         serviceUuids: [],
