@@ -1387,6 +1387,40 @@ describe('AE02 dispatch (#75, #235)', () => {
       expect(config).toEqual([0x13, 0x09, 0xff, 0x01, 0x10, 0x00, 0x00, 0x00, 0x2c]);
     });
 
+    // The A00D history-response pair had no coverage at all before #235/#75
+    // put its payload byte in question, so these pin both the default and the
+    // override.
+    it('sends the A00D history response with the default payload byte 0xFE', async () => {
+      const adapter = makeAdapter();
+      const writes = await driveHandshake(adapter, makeExtendedScaleInfo());
+      const msg1 = writes.find((w) => w[0] === 0xa0 && w[2] === 0x04);
+      expect(msg1).toBeDefined();
+      expect(msg1![3]).toBe(0xfe);
+      expect(msg1![12]).toBe(msg1!.slice(0, 12).reduce((a, b) => a + b, 0) & 0xff);
+    });
+
+    it('applies ble.qn_report_byte to the A00D payload byte and recomputes the checksum', async () => {
+      // 0xFC is the value both vendor-app captures send in this position.
+      const adapter = makeAdapter();
+      adapter.configure({ qnReportByte: 0xfc });
+      const writes = await driveHandshake(adapter, makeExtendedScaleInfo());
+      const msg1 = writes.find((w) => w[0] === 0xa0 && w[2] === 0x04);
+      expect(msg1![3]).toBe(0xfc);
+      expect(msg1![12]).toBe(msg1!.slice(0, 12).reduce((a, b) => a + b, 0) & 0xff);
+    });
+
+    it('leaves the second A00D frame alone when the report byte is overridden', async () => {
+      // Only byte[3] of the 0x04 frame is in question. The 0x02 frame is a
+      // separate command and must not move with it.
+      const adapter = makeAdapter();
+      adapter.configure({ qnReportByte: 0xfc });
+      const writes = await driveHandshake(adapter, makeExtendedScaleInfo());
+      const msg2 = writes.find((w) => w[0] === 0xa0 && w[2] === 0x02);
+      expect(msg2).toEqual([
+        0xa0, 0x0d, 0x02, 0x01, 0x00, 0x08, 0x00, 0x21, 0x06, 0xb8, 0x04, 0x02, 0x9d,
+      ]);
+    });
+
     it('20B 0x12 frame makes the 0x22 START byte identical to the vendor app', async () => {
       const adapter = makeAdapter();
       const writes = await driveHandshake(adapter, makeExtendedScaleInfo());

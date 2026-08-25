@@ -45,6 +45,8 @@ else
 
   SCALE_MAC=$(opt scale_mac)
   FORCE_SCALE_ADAPTER=$(opt force_scale_adapter)
+  QN_PROTOCOL_BYTE=$(opt qn_protocol_byte)
+  QN_REPORT_BYTE=$(opt qn_report_byte)
 
   WEIGHT_UNIT=$(opt weight_unit)
   HEIGHT_UNIT=$(opt height_unit)
@@ -135,12 +137,31 @@ YAML
     FORCE_SCALE_ADAPTER=""
   fi
 
-  # BLE section (only if scale_mac, adapter or a forced scale adapter is set)
-  if [ -n "$SCALE_MAC" ] || [ -n "$BLE_ADAPTER" ] || [ -n "$FORCE_SCALE_ADAPTER" ]; then
+  # The two QN bytes are text options so that "unset" stays distinguishable from
+  # 0, which is a meaningful value for both. Anything that is not a plain 0 to
+  # 255 integer is dropped with a warning rather than written into config.yaml,
+  # where it would fail schema validation and stop the add-on from starting.
+  for _qn in QN_PROTOCOL_BYTE QN_REPORT_BYTE; do
+    eval "_qv=\$$_qn"
+    [ -z "$_qv" ] && continue
+    case "$_qv" in
+      ''|*[!0-9]*) _ok=0 ;;
+      *) [ "$_qv" -le 255 ] && _ok=1 || _ok=0 ;;
+    esac
+    if [ "$_ok" != "1" ]; then
+      log "WARNING: Invalid $(echo "$_qn" | tr '[:upper:]' '[:lower:]') '$_qv' (expected 0 to 255). Ignoring."
+      eval "$_qn=''"
+    fi
+  done
+
+  # BLE section (only if scale_mac, adapter, a forced scale adapter or a QN byte is set)
+  if [ -n "$SCALE_MAC" ] || [ -n "$BLE_ADAPTER" ] || [ -n "$FORCE_SCALE_ADAPTER" ]     || [ -n "$QN_PROTOCOL_BYTE" ] || [ -n "$QN_REPORT_BYTE" ]; then
     echo "ble:" >> "$FRESH"
     [ -n "$SCALE_MAC" ] && echo "  scale_mac: \"$(yaml_escape "$SCALE_MAC")\"" >> "$FRESH"
     [ -n "$BLE_ADAPTER" ] && echo "  adapter: \"$(yaml_escape "$BLE_ADAPTER")\"" >> "$FRESH"
     [ -n "$FORCE_SCALE_ADAPTER" ] && echo "  force_scale_adapter: \"$(yaml_escape "$FORCE_SCALE_ADAPTER")\"" >> "$FRESH"
+    [ -n "$QN_PROTOCOL_BYTE" ] && echo "  qn_protocol_byte: $QN_PROTOCOL_BYTE" >> "$FRESH"
+    [ -n "$QN_REPORT_BYTE" ] && echo "  qn_report_byte: $QN_REPORT_BYTE" >> "$FRESH"
     echo "" >> "$FRESH"
   fi
 

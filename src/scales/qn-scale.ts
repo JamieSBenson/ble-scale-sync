@@ -114,6 +114,34 @@ const CHR_SIG_WEIGHT_MEASUREMENT = uuid16(0x2a9d);
 const SCALE_EPOCH_OFFSET = 946684800;
 
 /**
+ * Payload byte of the A00D history-response frame sent in reply to the scale's
+ * 0x21 config request: `a0 0d 04 <byte> 00 ...`.
+ *
+ * 0xFE comes from openScale's QNHandler, which annotates it only as "Payload"
+ * and took it from an ES-30M BLE capture. Two vendor-app captures on other
+ * firmware in this family send 0xFC in the same position instead:
+ *
+ *   #235  GE CS 10 G, 20-byte extended dialect
+ *   #75   Arboleaf QN-Scale FW V39, 19-byte es26m dialect
+ *
+ * Both were taken from sessions where the vendor app completed a weigh-in while
+ * this adapter saw the whole handshake acknowledged and then silence, and both
+ * reporters reached the same reading of it independently: that the byte selects
+ * between a live report stream and the stored-history path.
+ *
+ * That reading is NOT established, and the default therefore does not move.
+ * openScale dispatches live 0x10 weight frames while sending 0xFE, so the byte
+ * plainly does not gate the live stream on the firmware it was captured from,
+ * and the 0x23 stored-record path this adapter relies on for V10 Renpho and
+ * ES-CS20M firmware (#213) hangs off the same exchange. A wrong value here is
+ * silent in exactly the way a wrong `qn_protocol_byte` is: every command is
+ * acknowledged and no weight ever arrives. So `ble.qn_report_byte` exists to
+ * let the reporters test 0xFC on their own hardware, and the default changes
+ * only if that produces a reading.
+ */
+const REPORT_BYTE_DEFAULT = 0xfe;
+
+/**
  * Grace period (ms) to wait for an impedance frame after the first stable
  * R1=R2=0 frame on long-frame variants (e.g. ES-26M). If an impedance frame
  * arrives within this window, it supersedes the weight-only reading. If not,
@@ -340,6 +368,12 @@ export class QnScaleAdapter
   private forcedProtocolType: number | null = null;
 
   /**
+   * Payload byte of the A00D history-response frame, forced by
+   * `ble.qn_report_byte` (#235, #75, #331). Null leaves REPORT_BYTE_DEFAULT.
+   */
+  private forcedReportByte: number | null = null;
+
+  /**
    * Whether a completed-weigh-in result frame (0xB4/0xB1) has already produced a
    * reading this session. The scale repeats the 0xB4 frame ~3x and then sends
    * the 0xB1 records, all describing the one weigh-in, so the reading is emitted
@@ -379,6 +413,7 @@ export class QnScaleAdapter
   configure(opts: AdapterRuntimeConfig): void {
     if (opts.weightUnit) this.displayUnit = opts.weightUnit;
     this.forcedProtocolType = opts.qnProtocolByte ?? null;
+    this.forcedReportByte = opts.qnReportByte ?? null;
   }
 
   /** 0x13 config unit flag: 0x01 kg, 0x02 lb (openScale QNHandler). */
@@ -1132,9 +1167,31 @@ export class QnScaleAdapter
     this.historyResponseSent = true;
     const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-    // A00D response 1 (from openScale QNHandler)
-    const msg1 = [0xa0, 0x0d, 0x04, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    // A00D response 1 (from openScale QNHandler). byte[3] is the payload byte
+    // `ble.qn_report_byte` overrides; see REPORT_BYTE_DEFAULT.
+    const msg1 = [
+      0xa0,
+      0x0d,
+      0x04,
+      this.forcedReportByte ?? REPORT_BYTE_DEFAULT,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+    ];
     msg1[12] = msg1.reduce((a, b) => a + b, 0) & 0xff;
+    if (this.forcedReportByte !== null) {
+      bleLog.debug(
+        `QN: history response byte forced to ` +
+          `0x${this.forcedReportByte.toString(16).padStart(2, '0')} ` +
+          `(default 0x${REPORT_BYTE_DEFAULT.toString(16)})`,
+      );
+    }
     await this.writeCmd(msg1);
 
     await wait(200);

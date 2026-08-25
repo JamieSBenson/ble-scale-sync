@@ -60,6 +60,7 @@ ble:
   # force_scale_adapter: 'Hutbit'
   # session_timeout_sec: 20
   # qn_protocol_byte: 0
+  # qn_report_byte: 252
 ```
 
 | Field                 | Required                    | Default        | Description                                                                                                                                                                                                                                        |
@@ -72,6 +73,7 @@ ble:
 | `force_scale_adapter` | No                          | Auto-detect    | Name of the scale protocol adapter to use, bypassing auto-detection. Requires `scale_mac`. See below.                                                                                                                                              |
 | `session_timeout_sec` | No                          | `120`          | Seconds one GATT session may wait for a complete reading (5 to 600). Native BLE handlers only; ignored on `mqtt-proxy` and `esphome-proxy`. See below.                                                                                             |
 | `qn_protocol_byte`    | No                          | Auto           | QN-family scales only. Protocol byte the handshake echoes back to the scale (0 to 255). Set it when a QN scale runs the whole handshake and then reports nothing, or when its scale-info frame is lost in transit on a proxy transport. See below. |
+| `qn_report_byte`      | No                          | `254` (0xFE)   | QN-family scales only. Payload byte of the history-response frame (0 to 255). Try `252` (0xFC) when a QN scale completes the handshake and then reports nothing. See below.                                                                        |
 | `mqtt_proxy`          | If `handler: mqtt-proxy`    | (none)         | MQTT proxy connection (`broker_url`, `device_id`, `topic_prefix`, `username`, `password`, `auto_connect`, `embedded_broker_*`). See [ESP32 BLE Proxy](./esp32-proxy).                                                                              |
 | `esphome_proxy`       | If `handler: esphome-proxy` | (none)         | ESPHome Native API connection (`host`, `port`, `encryption_key` or `password`, `client_info`). See [ESPHome Bluetooth Proxy](./esphome-proxy).                                                                                                     |
 
@@ -115,6 +117,36 @@ QN: fallback: no 0x12 received, running handshake with proto=0x15
 ```
 
 If a value makes your scale work, please say so in an issue with the model and that line: the default is set from the models we have evidence for, and yours may change it.
+
+:::
+
+::: tip QN scales that still report nothing (`qn_report_byte`)
+
+If `qn_protocol_byte` did not help, there is one more byte worth trying, and it is a separate one.
+
+When the scale asks for its configuration (`0x21`), the handshake answers with a history-response frame:
+
+```
+a0 0d 04 fe 00 00 00 00 00 00 00 00 <checksum>
+                ^^
+```
+
+That `fe` comes from openScale, which took it from a capture of an ES-30M and labels it only as a payload byte. Vendor-app captures of two other scales in the family send `fc` in the same position: a GE CS 10 G and an Arboleaf QN-Scale on firmware V39. Both captures are of sessions where the vendor app completed a weigh-in, on scales where this app sees the whole handshake acknowledged and then nothing.
+
+What the byte actually selects is not known. Both reporters read it as choosing between a live weight stream and the stored-history path, which fits their symptoms, but openScale receives live weight frames while sending `fe`, so that reading cannot be the whole story. The default therefore stays where the evidence is:
+
+```yaml
+ble:
+  qn_report_byte: 252 # 0xFC, the value both vendor-app captures send
+```
+
+With debug logging on, a session running an overridden byte says so:
+
+```
+QN: history response byte forced to 0xfc (default 0xfe)
+```
+
+If `252` makes your scale produce a weight, please say so in an issue with the model, the dialect from the `QN: scale info` line and that log line. Two confirmations on different firmware would be enough to move the default.
 
 :::
 

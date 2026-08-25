@@ -140,6 +140,26 @@ export const BleSchema = z
      * (proxy transports) and sessions without it open on the wrong byte.
      */
     qn_protocol_byte: z.number().int().min(0).max(255).optional().nullable(),
+    /**
+     * Payload byte of the QN A00D history-response frame, default 0xFE (#235,
+     * #75, #331).
+     *
+     * The handshake answers the scale's 0x21 config request with
+     * `a0 0d 04 <byte> 00 ...`. The default comes from openScale's QNHandler,
+     * which took it from an ES-30M capture. Two vendor-app captures on other
+     * firmware in the same family send 0xFC there instead: a GE CS 10 G (20-byte
+     * dialect) and an Arboleaf QN-Scale V39 (19-byte es26m), both from sessions
+     * that produced a reading in the vendor app while ble-scale-sync saw the
+     * handshake acknowledged and then silence.
+     *
+     * What the byte selects is NOT decoded. openScale annotates it only as
+     * "Payload", and it demonstrably does not gate the live 0x10 stream, since
+     * openScale receives those frames while sending 0xFE. So this ships as a
+     * setting rather than a changed default: on a scale that reads today, 0xFE
+     * is the value with evidence behind it, and a wrong choice here is silent in
+     * exactly the way `qn_protocol_byte` is.
+     */
+    qn_report_byte: z.number().int().min(0).max(255).optional().nullable(),
     mqtt_proxy: MqttProxySchema.optional(),
     esphome_proxy: EsphomeProxySchema.optional(),
   })
