@@ -267,19 +267,38 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
       // peers the whole Device object) once discovery stops (#297).
       const advert = await logAdvertisementSnapshot(device);
 
-      // Pre-connection adapter match (by name only). Needed for preferPassive adapters
-      // so we can skip the GATT connect entirely and go straight to broadcast scanning.
-      // Limitation: serviceUuids is empty pre-connect (BlueZ does not expose advertised
-      // service UUIDs through D-Bus before connection), so adapters whose `matches()`
-      // returns true only on serviceUuids are NOT detected here and will fall through
-      // to the GATT path even when `preferPassive=true`. All current passive adapters
-      // (e.g. Mi Scale 2 `MIBFS`) match by name. To support a UUID-only passive
-      // adapter, add a `passiveServiceUuids: string[]` hint to ScaleAdapter and check
-      // it here against the advertised UUIDs from BlueZ ServiceData.
-      const preInfo: BleDeviceInfo = { localName: name, serviceUuids: [] };
+      // Pre-connection adapter match. Needed for preferPassive adapters so we can
+      // skip the GATT connect entirely and go straight to broadcast scanning.
+      //
+      // The snapshot above already reads ManufacturerData and ServiceData off the
+      // Device1 object, so both are fed in here rather than thrown away. Matching
+      // on the name alone could not reach a passive adapter whose device
+      // advertises a generic name: the Silvergear 108 calls itself "108", which is
+      // far too weak to claim on, while its manufacturer data identifies it
+      // exactly (#297).
+      //
+      // Limitation that remains: serviceUuids is still empty pre-connect, because
+      // BlueZ does not expose advertised service UUIDs through D-Bus before
+      // connection, so an adapter matching only on serviceUuids still falls
+      // through to the GATT path.
+      //
+      // Scope: the result is used only to take the passive branch below. A device
+      // that now matches a connect-based adapter here falls through exactly as it
+      // did before and is re-resolved after discovery.
+      const preInfo: BleDeviceInfo = {
+        localName: name,
+        serviceUuids: [],
+        ...(advert.manufacturerData ? { manufacturerData: advert.manufacturerData } : {}),
+        ...(advert.serviceData && advert.serviceData.length > 0
+          ? { serviceData: advert.serviceData }
+          : {}),
+      };
       const preMatchedAdapter = resolveAdapter(preInfo, adapters);
 
-      if (preMatchedAdapter?.preferPassive && preMatchedAdapter.parseServiceData) {
+      if (
+        preMatchedAdapter?.preferPassive &&
+        (preMatchedAdapter.parseServiceData || preMatchedAdapter.parseBroadcast)
+      ) {
         matchedAdapter = preMatchedAdapter;
         bleLog.info(`Matched adapter: ${matchedAdapter.name}`);
         return await broadcastScanNodeBle(matchedAdapter, btAdapter, device, mac, {
@@ -362,8 +381,11 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
       deviceMac = result.mac;
       await logAdvertisementSnapshot(device);
 
-      // Passive-mode adapters: read from service-data advertisements without connecting.
-      if (matchedAdapter.preferPassive && matchedAdapter.parseServiceData) {
+      // Passive-mode adapters: read from advertisements without connecting.
+      if (
+        matchedAdapter.preferPassive &&
+        (matchedAdapter.parseServiceData || matchedAdapter.parseBroadcast)
+      ) {
         bleLog.info(`Matched adapter: ${matchedAdapter.name}`);
         return await broadcastScanNodeBle(matchedAdapter, btAdapter, device, result.mac, {
           abortSignal,

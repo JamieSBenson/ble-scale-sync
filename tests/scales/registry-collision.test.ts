@@ -41,6 +41,13 @@ const FIXTURES: Record<string, BleDeviceInfo> = {
     manufacturerData: { id: 0x0157, data: Buffer.from('70879eede5e7', 'hex') },
     serviceData: [{ uuid: '181d', data: Buffer.from('238e4eea070818103913', 'hex') }],
   },
+  // Broadcast-only, non-connectable. Claims on the invented company id 0xA0AC
+  // plus the exact 12-byte payload and its checksum; the name "108" is ignored.
+  'Silvergear Smart Scale 108': {
+    localName: '108',
+    serviceUuids: ['ffb0'],
+    manufacturerData: { id: 0xa0ac, data: Buffer.from('4fe9916185a0202d07600da1', 'hex') },
+  },
   'Xiaomi Mi Scale 2': { localName: 'MIBFS', serviceUuids: [] },
   'Xiaomi Mijia Scale S800': { localName: 'Mijia Scale S800 A1AB', serviceUuids: [] },
   Yunmai: { localName: 'Yunmai', serviceUuids: [] },
