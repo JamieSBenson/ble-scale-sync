@@ -63,14 +63,17 @@ describe('Multi-user flow: matching → profile resolution', () => {
     expect(profile.gender).toBe('female');
   });
 
-  it('converts height from inches when height_unit is in', () => {
+  it('preserves stored height in cm even when height_unit is in', () => {
+    // After the fix, the wizard converts inches to cm before storing in config.yaml.
+    // resolveUserProfile always treats the stored value as cm regardless of height_unit.
+    // 72 inches → wizard stores 182.88 cm → resolveUserProfile returns 182.88 cm.
     const inchConfig: AppConfig = {
       ...appConfig,
       scale: { weight_unit: 'kg', height_unit: 'in' },
     };
     const user: UserConfig = {
       ...dad,
-      height: 72, // 72 inches = 182.88 cm
+      height: 182.88, // wizard already converted 72 inches to cm
     };
     const profile = resolveUserProfile(user, inchConfig.scale);
     expect(profile.height).toBeCloseTo(182.88, 1);

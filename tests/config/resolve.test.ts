@@ -51,15 +51,25 @@ describe('resolveUserProfile', () => {
     expect(profile.age).toBe(expectedAge);
   });
 
-  it('preserves height in cm when height_unit is cm', () => {
-    const profile = resolveUserProfile(USER, SCALE_CM);
-    expect(profile.height).toBe(183);
+  it('preserves height in cm regardless of height_unit setting', () => {
+    // height_unit is a display-only setting; the stored height is always in cm.
+    // Regression: the old code multiplied by 2.54 when height_unit was 'in',
+    // so a user who wrote height: 172 (cm) with height_unit: in got a profile
+    // height of 436.88 cm and a BMI of 3.8 instead of 24.79.
+    const profileCm = resolveUserProfile(USER, SCALE_CM);
+    expect(profileCm.height).toBe(183);
+
+    const profileIn = resolveUserProfile(USER, SCALE_IN);
+    expect(profileIn.height).toBe(183); // same raw value, not multiplied by 2.54
   });
 
-  it('converts height from inches to cm when height_unit is in', () => {
-    const userInches = { ...USER, height: 72 };
-    const profile = resolveUserProfile(userInches, SCALE_IN);
-    expect(profile.height).toBeCloseTo(72 * 2.54, 2);
+  it('does not convert inches to cm (wizard handles the conversion before storing)', () => {
+    // When the wizard runs with height_unit: 'in' and the user enters 68 inches,
+    // it converts to 172.72 cm before writing config.yaml. resolveUserProfile
+    // then sees 172.72 and treats it as cm (no further conversion).
+    const userFromWizard = { ...USER, height: 172.72 };
+    const profile = resolveUserProfile(userFromWizard, SCALE_IN);
+    expect(profile.height).toBeCloseTo(172.72, 2);
   });
 
   it('maps gender correctly', () => {

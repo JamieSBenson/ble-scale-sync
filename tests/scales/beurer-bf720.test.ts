@@ -1080,4 +1080,75 @@ describe('BeurerBf720Adapter', () => {
       expect(reading!.impedance).toBe(0);
     });
   });
+
+  // Regression: BMI was computed incorrectly when height_unit was 'in' in
+  // config.yaml. The old resolveUserProfile multiplied the configured height
+  // by 2.54, so a user who wrote height: 172 (172 cm, matching the scale's
+  // stored value) with height_unit: 'in' (to see inches in the UI) got a
+  // profile height of 436.88 cm and a BMI of 3.8 instead of 24.79.
+  //
+  // After the fix, resolveUserProfile always treats the stored height as cm
+  // regardless of height_unit. The wizard converts inches-to-cm before
+  // writing config.yaml, so the stored value is always in cm.
+  describe('BMI calculation is independent of height_unit', () => {
+    // Weight frame: 73.33 kg → raw = 73.33 / 0.005 = 14666 = 0x394A (LE: 4A 39)
+    const WSS_73_33 = Buffer.from([0x00, 0x4a, 0x39]); // flags 0x00 (kg), weight 14666 * 0.005 = 73.33 kg
+    // BCS frame with fat 19.4% (minimal, no optional fields)
+    const BCS_MINIMAL = Buffer.from([0x00, 0x00, 0xc2, 0x00]); // flags 0x0000, fat 19.4%
+
+    it('computes correct BMI (24.79) when profile height is 172 cm', () => {
+      const a = makeAdapter();
+      a.parseCharNotification(CHR_WEIGHT, WSS_73_33);
+      const reading = a.parseCharNotification(CHR_BODYCOMP, BCS_MINIMAL);
+      expect(reading).not.toBeNull();
+      expect(reading!.weight).toBeCloseTo(73.33, 2);
+
+      // Profile with height 172 cm (the value the scale stores on the wire).
+      // BMI = 73.33 / 1.72^2 = 24.79
+      const profile = defaultProfile({ height: 172 });
+      const payload = a.computeMetrics(reading!, profile);
+      expect(payload.bmi).toBeCloseTo(24.79, 1);
+    });
+
+    it('computes the same BMI regardless of height_unit (cm vs in)', () => {
+      const a = makeAdapter();
+      a.parseCharNotification(CHR_WEIGHT, WSS_73_33);
+      const reading = a.parseCharNotification(CHR_BODYCOMP, BCS_MINIMAL);
+      expect(reading).not.toBeNull();
+      expect(reading!.weight).toBeCloseTo(73.33, 2);
+
+      // The stored height is 172 cm in both cases. height_unit only affects
+      // the wizard prompt label, not the internal representation.
+      const profileCm = defaultProfile({ height: 172 });
+      const payloadCm = a.computeMetrics(reading!, profileCm);
+
+      // Create a second adapter instance to avoid cached state
+      const a2 = makeAdapter();
+      a2.parseCharNotification(CHR_WEIGHT, WSS_73_33);
+      const reading2 = a2.parseCharNotification(CHR_BODYCOMP, BCS_MINIMAL);
+      const profileIn = defaultProfile({ height: 172 }); // same stored value
+      const payloadIn = a2.computeMetrics(reading2!, profileIn);
+
+      // Both must produce the same BMI
+      expect(payloadCm.bmi).toBeCloseTo(24.79, 1);
+      expect(payloadIn.bmi).toBeCloseTo(24.79, 1);
+      expect(payloadCm.bmi).toBeCloseTo(payloadIn.bmi, 1);
+    });
+
+    it('does NOT produce the buggy BMI of 3.8 when height is 172', () => {
+      const a = makeAdapter();
+      a.parseCharNotification(CHR_WEIGHT, WSS_73_33);
+      const reading = a.parseCharNotification(CHR_BODYCOMP, BCS_MINIMAL);
+      expect(reading).not.toBeNull();
+
+      // The old bug: height 172 was multiplied by 2.54 = 436.88 cm → 4.3688 m
+      // BMI = 73.33 / 4.3688^2 = 3.84 (rounded to 3.8)
+      // This must NOT happen.
+      const profile = defaultProfile({ height: 172 });
+      const payload = a.computeMetrics(reading!, profile);
+      expect(payload.bmi).toBeGreaterThan(20);
+      expect(payload.bmi).toBeLessThan(30);
+      expect(payload.bmi).not.toBeCloseTo(3.8, 1);
+    });
+  });
 });

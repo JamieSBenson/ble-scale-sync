@@ -28,15 +28,23 @@ function computeAge(birthDate: string): number {
 
 /**
  * Resolve a UserConfig + ScaleConfig into a UserProfile for body composition calculation.
+ *
+ * The configured `user.height` is always stored in centimeters — matching the
+ * on-wire format of every scale adapter (the SIG Height characteristic, the
+ * Renpho protocol, the Xiaomi S800 broadcast, etc.).  `scale.height_unit` is
+ * a display-only setting used by the wizard prompt label and any future UI that
+ * renders the value back to the user; it must NOT influence the internal
+ * representation or the BMI calculation (weight / height_m²).
+ *
+ * Regression: when height_unit was 'in' the old code multiplied by 2.54, so a
+ * user who wrote `height: 172` (172 cm, matching the scale's stored value) with
+ * `height_unit: in` (to see inches in the UI) got a profile height of 436.88 cm
+ * and a BMI of 3.8 instead of 24.79.
  */
-export function resolveUserProfile(user: UserConfig, scaleConfig: ScaleConfig): UserProfile {
-  let height = user.height;
-  if (scaleConfig.height_unit === 'in') {
-    height = height * 2.54;
-  }
-
+export function resolveUserProfile(user: UserConfig, _scaleConfig: ScaleConfig): UserProfile {
+  // height is always in centimeters — the unit every adapter's protocol uses on the wire.
   return {
-    height,
+    height: user.height,
     age: computeAge(user.birth_date),
     gender: user.gender,
     isAthlete: user.is_athlete,

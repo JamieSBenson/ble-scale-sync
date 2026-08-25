@@ -60,7 +60,15 @@ async function promptUser(ctx: WizardContext, existingSlugs: string[]): Promise<
 
   const heightLabel = heightUnit === 'in' ? 'Height (inches):' : 'Height (cm):';
   const heightStr = await prompts.input(heightLabel, { validate: validatePositiveNumber });
-  const height = Number(heightStr);
+  let height = Number(heightStr);
+
+  // The config always stores height in centimeters (the on-wire unit every scale
+  // protocol uses). When the user enters inches we convert here so that
+  // resolveUserProfile never has to guess the unit.
+  if (heightUnit === 'in') {
+    height = Math.round(height * 2.54 * 100) / 100;
+    console.log(dim(`  → stored as ${height} cm`));
+  }
 
   const birth_date = await prompts.input('Birth date (YYYY-MM-DD):', { validate: validateDate });
 
