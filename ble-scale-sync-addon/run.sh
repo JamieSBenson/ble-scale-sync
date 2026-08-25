@@ -39,6 +39,19 @@ if [ "$CUSTOM_CONFIG" = "true" ]; then
     log "ERROR: Failed to copy custom config from $CUSTOM_PATH"
     exit 1
   fi
+  # In this mode the whole option-to-config generation below is skipped, so any
+  # UI option set here does nothing. Say so for the two QN bytes specifically:
+  # they are diagnostic knobs handed to reporters who are chasing a scale that
+  # reads nothing, and someone who already moved to custom_config to set one by
+  # hand is exactly the person who would toggle the UI option, see no change and
+  # report a false negative. A wrong value for either is silent by nature, so a
+  # setting that is silently ignored is worse here than almost anywhere else.
+  for _qn in qn_protocol_byte qn_report_byte; do
+    if [ -n "$(opt "$_qn")" ]; then
+      log "WARNING: custom_config is enabled, so the '$_qn' option is ignored."
+      log "Set 'ble.$_qn' in $CUSTOM_PATH instead."
+    fi
+  done
 else
 
   # ── Read all options ────────────────────────────────────────────────────
@@ -141,16 +154,42 @@ YAML
   # 0, which is a meaningful value for both. Anything that is not a plain 0 to
   # 255 integer is dropped with a warning rather than written into config.yaml,
   # where it would fail schema validation and stop the add-on from starting.
+  #
+  # The value is normalised to decimal before it is written. This file is later
+  # round-tripped through PyYAML, which is YAML 1.1 and reads a leading zero as
+  # octal: "010" would reach the adapter as 8 and "064" as 52. Both of these
+  # settings fail silently when wrong (every command acknowledged, no weight
+  # ever arriving), so a reporter told to try a value and typing a leading zero
+  # would run a different experiment and report a false negative. Surrounding
+  # whitespace is trimmed for the same reason: it comes free from a text field.
   for _qn in QN_PROTOCOL_BYTE QN_REPORT_BYTE; do
     eval "_qv=\$$_qn"
+    _qv=$(printf '%s' "$_qv" | tr -d '[:space:]')
     [ -z "$_qv" ] && continue
+    _raw="$_qv"
     case "$_qv" in
-      ''|*[!0-9]*) _ok=0 ;;
-      *) [ "$_qv" -le 255 ] && _ok=1 || _ok=0 ;;
+      *[!0-9]*) _ok=0 ;;
+      *)
+        # Strip leading zeros with sed, not with `$((10#$_qv))`: that form is a
+        # bashism, this script runs under /bin/sh, and /bin/sh on the add-on
+        # base image is dash, which rejects base#digits outright.
+        _qv=$(printf '%s' "$_qv" | sed 's/^0*//')
+        [ -z "$_qv" ] && _qv=0
+        case "$_qv" in
+          # Bound the length before the numeric test: an overlong digit string
+          # makes `[ -le ]` emit a raw "integer expression expected" line ahead
+          # of the friendly warning, and that raw line is what ends up pasted
+          # into an issue.
+          ????*) _ok=0 ;;
+          *) [ "$_qv" -le 255 ] && _ok=1 || _ok=0 ;;
+        esac
+        ;;
     esac
     if [ "$_ok" != "1" ]; then
-      log "WARNING: Invalid $(echo "$_qn" | tr '[:upper:]' '[:lower:]') '$_qv' (expected 0 to 255). Ignoring."
+      log "WARNING: Invalid $(echo "$_qn" | tr '[:upper:]' '[:lower:]') '$_raw' (expected 0 to 255). Ignoring."
       eval "$_qn=''"
+    else
+      eval "$_qn=\$_qv"
     fi
   done
 
