@@ -33,13 +33,24 @@ const LEFU_COMPANY_ID = 0x02ac;
 const SVC_FFB0 = 'ffb0';
 
 /**
- * Second service in the same advertising data element as FFB0 on the observed
- * unit. Almost certainly a generic Lefu OEM service rather than a Hutbit
- * marker, so it narrows this claim against unrelated devices squatting on
- * RTB Elektronik's company id, and probably does NOT discriminate the Hutbit
- * from a Robi S9 or an MGB. It fails closed and costs nothing on the captured
- * advertisement, so it is required until someone with MGB or Robi hardware
- * reports whether those units carry it too (#278).
+ * Second service in the same advertising data element as FFB0 on the unit
+ * captured for #278. Almost certainly a generic Lefu OEM service rather than a
+ * Hutbit marker, so it narrows this claim against unrelated devices squatting
+ * on RTB Elektronik's company id, and it does NOT discriminate the Hutbit from
+ * a Robi S9 or an MGB.
+ *
+ * It is NOT universal within the family. A Juniper-branded unit running the
+ * same Lefu AC02 protocol advertises FFB0 alone (#322):
+ *
+ *   Advert: name="SWAN" uuids=[ffb0] manufacturerData={0x02ac: c3b4d5ecb60100}
+ *
+ * That unit's payload is its own MAC reversed plus the 0x00 status byte, and
+ * its traffic is genuine AC02 (stable `ac 02 04 06 00 00 ca d4` = 103.0 kg,
+ * then `ac 02 fd 01 02 09 cb d4` = 521 ohm, both checksum-valid). Requiring
+ * D618 sent it to the MGB adapter, whose parser rejects every frame it sends,
+ * so the session ended in a GATT reading timeout every cycle.
+ *
+ * It is still required for NAMELESS advertisements. See `isHutbitOemAdvert`.
  */
 const SVC_D618 = 'd618';
 
@@ -69,15 +80,35 @@ const SVC_D618 = 'd618';
  * proxy the local name arrives empty because it lives in the scan response.
  * The manufacturer data and service list ride in the advertisement proper, so
  * they survive every transport that populates `manufacturerData`.
+ *
+ * D618 is required only when the advertisement carries NO local name, and the
+ * asymmetry is deliberate. The nameless FFB0 space belongs to the Robi S9,
+ * which claims it on FFB0 plus its FFB3 result characteristic at a higher
+ * priority, and a Robi reaching a proxy transport arrives nameless by
+ * construction. Dropping D618 there would hand those units to this adapter,
+ * which subscribes FFB1/FFB2 only and rejects every 20-byte Robi frame on
+ * length (#248 runs on exactly that transport). A NAMED advertisement has
+ * already been through the name branches of every adapter in this family
+ * before it reaches here: `RobiS9Adapter.matches()` bows out of `swan`,
+ * `icomon` and `yg` and claims `robi` before it consults this predicate at
+ * all, so relaxing the named case cannot take a device from it.
+ *
+ * What the named case does still take, and it is worth being plain about it:
+ * an MGB Swan/Icomon/YG that squatted on the same company id with a 6- or
+ * 7-byte payload and no D618 would now be claimed here at priority 35 instead
+ * of by MGB at 30. No such unit has been reported, the failure mode is a
+ * refused read rather than a wrong weight (each parser rejects the other's
+ * frames on length), and `ble.force_scale_adapter` with `ble.scale_mac` is the
+ * escape hatch if one turns up.
  */
 export function isHutbitOemAdvert(device: BleDeviceInfo): boolean {
   const m = device.manufacturerData;
   if (m?.id !== LEFU_COMPANY_ID) return false;
   if (m.data.length !== 6 && m.data.length !== 7) return false;
   if (m.data.length === 7 && m.data[6] !== 0x00 && m.data[6] !== 0x01) return false;
-  return (
-    uuidClaimHits([SVC_FFB0], device.serviceUuids) && uuidClaimHits([SVC_D618], device.serviceUuids)
-  );
+  if (!uuidClaimHits([SVC_FFB0], device.serviceUuids)) return false;
+  if (device.localName) return true;
+  return uuidClaimHits([SVC_D618], device.serviceUuids);
 }
 
 export { LEFU_COMPANY_ID };
