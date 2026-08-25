@@ -154,6 +154,16 @@ export interface AdapterRuntimeConfig {
    * The frame length picks a default; this overrides it (#75, #331).
    */
   qnProtocolByte?: number;
+  /**
+   * Payload byte of the QN A00D history-response frame (`ble.qn_report_byte`).
+   *
+   * Defaults to 0xFE, the value openScale's ES-30M capture uses. Two vendor-app
+   * captures on other firmware in the family send 0xFC instead, from sessions
+   * that read successfully where this adapter saw the whole handshake
+   * acknowledged and then silence. What the byte selects is not decoded, so it
+   * is a setting rather than a changed default (#235, #75, #331).
+   */
+  qnReportByte?: number;
 }
 
 /**

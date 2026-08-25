@@ -114,6 +114,12 @@ Requires Node.js v22+ and a BLE adapter. See the **[full install guide](https://
 <td align="center"><a href="https://github.com/alexw23"><img src="https://avatars.githubusercontent.com/u/1505496?v=4" width="60" height="60" alt="alexw23"><br><sub>alexw23</sub></a></td>
 <td align="center"><a href="https://github.com/bondesen"><img src="https://avatars.githubusercontent.com/u/4944294?v=4" width="60" height="60" alt="bondesen"><br><sub>bondesen</sub></a></td>
 <td align="center"><a href="https://github.com/junaidk"><img src="https://avatars.githubusercontent.com/u/1422281?v=4" width="60" height="60" alt="junaidk"><br><sub>junaidk</sub></a></td>
+</tr><tr>
+<td align="center"><a href="https://github.com/hedoric"><img src="https://avatars.githubusercontent.com/u/135505862?v=4" width="60" height="60" alt="hedoric"><br><sub>hedoric</sub></a></td>
+<td align="center"><a href="https://github.com/alasano"><img src="https://avatars.githubusercontent.com/u/14372930?v=4" width="60" height="60" alt="alasano"><br><sub>alasano</sub></a></td>
+<td align="center"><a href="https://github.com/O-Palda"><img src="https://avatars.githubusercontent.com/u/68783617?v=4" width="60" height="60" alt="O-Palda"><br><sub>O-Palda</sub></a></td>
+<td align="center"><a href="https://github.com/Bretos"><img src="https://avatars.githubusercontent.com/u/4947212?v=4" width="60" height="60" alt="Bretos"><br><sub>Bretos</sub></a></td>
+<td align="center"><a href="https://github.com/albert-canfield"><img src="https://avatars.githubusercontent.com/u/153834574?v=4" width="60" height="60" alt="albert-canfield"><br><sub>albert-canfield</sub></a></td>
 </tr></table>
 
 ## Contributing

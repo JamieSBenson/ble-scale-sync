@@ -16,6 +16,7 @@ import {
   sleep,
   errMsg,
   withTimeout,
+  withIdleTimeout,
   resetAdapterBtmgmt,
   CONNECT_TIMEOUT_MS,
   MAX_CONNECT_RETRIES,
@@ -24,6 +25,7 @@ import {
   GATT_DISCOVERY_TIMEOUT_MS,
   IMPEDANCE_GRACE_MS,
   RAW_READING_TIMEOUT_MS,
+  READING_SESSION_CAP_FACTOR,
 } from './types.js';
 
 /**
@@ -599,18 +601,24 @@ export function createNobleHandler({ noble, getState }: NobleHandlerDeps) {
         // this the reading phase relies entirely on the peripheral eventually
         // disconnecting, so a stalled GATT session wedges the process (#283).
         const raw = await withTimeout(
-          waitForRawReading(
-            charMap,
-            wrapPeripheral(peripheral),
-            matchedAdapter,
-            profile,
-            peripheralAddress(peripheral).replace(/[:-]/g, '').toUpperCase(),
-            weightUnit,
-            onLiveData,
-            scaleAuth,
+          withIdleTimeout(
+            (onActivity) =>
+              waitForRawReading(
+                charMap,
+                wrapPeripheral(peripheral),
+                matchedAdapter,
+                profile,
+                peripheralAddress(peripheral).replace(/[:-]/g, '').toUpperCase(),
+                weightUnit,
+                onLiveData,
+                scaleAuth,
+                onActivity,
+              ),
+            readingTimeoutMs ?? RAW_READING_TIMEOUT_MS,
+            'Timed out waiting for a complete scale reading',
           ),
-          readingTimeoutMs ?? RAW_READING_TIMEOUT_MS,
-          'Timed out waiting for a complete scale reading',
+          (readingTimeoutMs ?? RAW_READING_TIMEOUT_MS) * READING_SESSION_CAP_FACTOR,
+          'GATT session cap exceeded',
         );
 
         return raw;
@@ -647,11 +655,17 @@ export function createNobleHandler({ noble, getState }: NobleHandlerDeps) {
       if (seen.has(addr)) return;
       seen.add(addr);
 
-      const name = peripheral.advertisement?.localName ?? '(unknown)';
+      // The sentinel is for display only. It must NOT reach `matches()`: it is
+      // a truthy string, and adapters that branch on whether an advertisement
+      // carries a name would read a nameless device as named, so this tool
+      // would report an adapter the read path does not choose. `npm run scan`
+      // is what users are told to run to fill in `ble.force_scale_adapter`, so
+      // a wrong answer here is acted on.
+      const localName = peripheral.advertisement?.localName ?? '';
       const svcUuids = (peripheral.advertisement?.serviceUuids ?? []).map(normalizeUuid);
       const mfgData = parseMfgData(peripheral.advertisement?.manufacturerData);
       const info: BleDeviceInfo = {
-        localName: name,
+        localName,
         serviceUuids: svcUuids,
         manufacturerData: mfgData,
       };
@@ -659,7 +673,7 @@ export function createNobleHandler({ noble, getState }: NobleHandlerDeps) {
 
       results.push({
         address: addr,
-        name,
+        name: localName || '(unknown)',
         matchedAdapter: matched?.name,
       });
     };
