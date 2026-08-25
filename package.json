@@ -63,5 +63,11 @@
     "typescript-eslint": "^8.62.1",
     "vitepress": "^1.6.4",
     "vitest": "^4.1.10"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "esbuild@0.21.5": true,
+    "usb@2.17.0": true,
+    "fsevents@2.3.3": true
   }
 }

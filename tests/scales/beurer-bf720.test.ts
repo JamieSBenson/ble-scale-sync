@@ -273,6 +273,8 @@ describe('BeurerBf720Adapter', () => {
         const reading = a.parseCharNotification(CHR_BODYCOMP, REAL_COMP);
         expect(reading).not.toBeNull();
         expect(reading!.weight).toBeCloseTo(117.92, 2);
+        // Impedance 0x0f55 = 3925 -> 392.5 Ω.
+        expect(reading!.impedance).toBeCloseTo(392.5, 1);
 
         const payload = a.computeMetrics(reading!, defaultProfile());
         expect(payload.bodyFatPercent).toBeCloseTo(24.3, 1);
@@ -974,6 +976,83 @@ describe('BeurerBf720Adapter', () => {
       a.onSessionEnd!();
       // A weight-only frame in the next session must not resolve on its own.
       expect(a.parseCharNotification(BODYCOMP, BCS_FRAME)).toBeNull();
+    });
+  });
+
+  // Regression: impedance was always reported as 0 because parseBodyComposition
+  // skipped the impedance field (off += 2) without reading it, and buildReading
+  // hardcoded impedance: 0. The offset computation was already dynamic and
+  // correct — the bug was that the value was never captured.
+  //
+  // Two real BF720 notifications with flags = 0x0398 (bits 3,4,7,8,9 — BMR,
+  // Muscle%, Soft Lean Mass, Body Water Mass, Impedance; no Timestamp/UserID/
+  // Weight/Height). The impedance bytes are the last two in each payload.
+  describe('impedance decoding regression', () => {
+    // Payload 1: 98 03 36 01 a1 18 4e 01 e2 24 5c 1a ec 13
+    // flags 0x0398, fat 0x0136=31.0%, water 0x1a5c, impedance 0x13ec=5100 -> 510.0 Ω
+    const BCS_PAYLOAD_1 = Buffer.from('98033601a1184e01e2245c1aec13', 'hex');
+    // Payload 2: 98 03 29 01 99 18 51 01 92 25 a6 1a 04 10
+    // flags 0x0398, fat 0x0129=29.7%, water 0x1aa6, impedance 0x1004=4100 -> 410.0 Ω
+    const BCS_PAYLOAD_2 = Buffer.from('98032901991851019225a61a0410', 'hex');
+
+    // Weight frame for pairing (kg, no timestamp).
+    const WSS_KG = Buffer.from([0x00, 0xc0, 0x3c]); // 156.00 * 0.005 = 78.00 kg
+
+    it('decodes impedance = 510.0 Ω from payload 1', () => {
+      const a = makeAdapter();
+      a.parseCharNotification(CHR_WEIGHT, WSS_KG);
+      const reading = a.parseCharNotification(CHR_BODYCOMP, BCS_PAYLOAD_1);
+      expect(reading).not.toBeNull();
+      expect(reading!.impedance).toBeCloseTo(510.0, 1);
+
+      const payload = a.computeMetrics(reading!, defaultProfile());
+      expect(payload.impedance).toBeCloseTo(510.0, 1);
+      // Verify bodyFatPercent still correct (regression guard).
+      expect(payload.bodyFatPercent).toBeCloseTo(31.0, 1);
+      // Water mass 0x1a5c = 6748 * 0.005 = 33.74 kg / 78.00 kg ~ 43.3%
+      expect(payload.waterPercent).toBeGreaterThan(40);
+      expect(payload.waterPercent).toBeLessThan(50);
+    });
+
+    it('decodes impedance = 410.0 Ω from payload 2', () => {
+      const a = makeAdapter();
+      a.parseCharNotification(CHR_WEIGHT, WSS_KG);
+      const reading = a.parseCharNotification(CHR_BODYCOMP, BCS_PAYLOAD_2);
+      expect(reading).not.toBeNull();
+      expect(reading!.impedance).toBeCloseTo(410.0, 1);
+
+      const payload = a.computeMetrics(reading!, defaultProfile());
+      expect(payload.impedance).toBeCloseTo(410.0, 1);
+      // Verify bodyFatPercent still correct (regression guard).
+      expect(payload.bodyFatPercent).toBeCloseTo(29.7, 1);
+      // Water mass 0x1aa6 = 6822 * 0.005 = 34.11 kg / 78.00 kg ~ 43.7%
+      expect(payload.waterPercent).toBeGreaterThan(40);
+      expect(payload.waterPercent).toBeLessThan(50);
+    });
+
+    it('uses the real impedance from the existing #168 BCS frame', () => {
+      // BCS_FRAME = 9803c200df1a9701cc2fca21a811
+      // flags 0x0398, impedance bytes a8 11 = 0x11a8 = 4520 -> 452.0 Ω
+      const a = makeAdapter();
+      a.parseCharNotification(CHR_WEIGHT, WSS_FRAME);
+      const reading = a.parseCharNotification(CHR_BODYCOMP, BCS_FRAME);
+      expect(reading).not.toBeNull();
+      expect(reading!.impedance).toBeCloseTo(452.0, 1);
+
+      const payload = a.computeMetrics(reading!, defaultProfile());
+      expect(payload.impedance).toBeCloseTo(452.0, 1);
+      // Regression: bodyFatPercent must still be correct.
+      expect(payload.bodyFatPercent).toBeCloseTo(19.4, 1);
+    });
+
+    it('reports impedance = 0 when the frame has no impedance flag', () => {
+      // flags 0x0000: only body fat, no impedance bit.
+      const noImpedance = Buffer.from([0x00, 0x00, 0xc2, 0x00]);
+      const a = makeAdapter();
+      a.parseCharNotification(CHR_WEIGHT, WSS_KG);
+      const reading = a.parseCharNotification(CHR_BODYCOMP, noImpedance);
+      expect(reading).not.toBeNull();
+      expect(reading!.impedance).toBe(0);
     });
   });
 });
