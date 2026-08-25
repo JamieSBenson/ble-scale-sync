@@ -158,7 +158,8 @@ ble-scale-sync/
 │   │   ├── exporter.ts              # Exporter interface & ExportResult
 │   │   ├── exporter-schema.ts       # ExporterSchema for self-describing exporters
 │   │   └── display-notifier.ts      # DisplayNotifier capability (transport-agnostic display/beep)
-│   └── scales/
+│   └── scales/                      # One file per adapter; a selection follows,
+│                                    # see index.ts for the authoritative registry
 │       ├── index.ts                 # Adapter registry (order matters: generic last)
 │       ├── body-comp-helpers.ts     # Shared body-comp utilities
 │       ├── qn-scale.ts              # QN / Renpho (incl. ES-26M, ES-30M) / Senssun / Sencor
@@ -183,6 +184,9 @@ ble-scale-sync/
 │       ├── active-era.ts            # Active Era BF-06
 │       ├── mgb.ts                   # MGB (Swan / Icomon / YG)
 │       ├── hoffen.ts                # Hoffen BS-8107
+│       ├── hutbit.ts                # Hutbit / Lefu FFB0 "AC02" family
+│       ├── robi-s9.ts               # Robi S9
+│       ├── silvergear-108.ts        # Silvergear 108 (broadcast only)
 │       └── standard-gatt.ts         # Generic BCS/WSS catch-all
 ├── tests/
 │   ├── body-comp-helpers.test.ts    # Body-comp math
@@ -197,7 +201,7 @@ ble-scale-sync/
 │   ├── config/                      # Schema, slugify, load, resolve, write, matching
 │   ├── ble/                         # Shared logic, utilities, handlers, abort signal
 │   ├── utils/                       # Retry, error
-│   ├── scales/                      # One file per adapter (30 files)
+│   ├── scales/                      # One test file per adapter, plus shared guards
 │   └── exporters/                   # config, garmin, mqtt (+multi-user), webhook, influxdb,
 │                                    # ntfy, telegram, intervals, strava, file, context, healthcheck, registry, index
 ├── ble-scale-sync-addon/            # Home Assistant Supervisor Add-on
