@@ -16,5 +16,12 @@ export function formatNotification(data: BodyComposition, context?: ExportContex
   if (context?.driftWarning) {
     lines.push(`⚠️ ${context.driftWarning}`);
   }
+  for (const r of context?.exportResults ?? []) {
+    // Error text is forwarded verbatim to a channel that may be public (an
+    // unauthenticated ntfy topic), so bound how much of it travels. Slice by
+    // code point so a multibyte character is never split into a replacement.
+    const error = [...(r.error ?? '')].slice(0, 120).join('');
+    lines.push(r.ok ? `✅ ${r.name}` : `❌ ${r.name}: ${error}`);
+  }
   return lines.join('\n');
 }
